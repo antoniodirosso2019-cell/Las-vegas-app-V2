@@ -56,6 +56,8 @@ type Player = {
   hasActed: boolean;
   privateHand?: CardType[] | null;
   declaredCount?: number | null;
+  folded?: boolean;
+  lastAction?: string; // display-only, must not contain card values
 };
 
 /**
@@ -90,7 +92,7 @@ function mulberry32(a: number) {
 
 /**
  * Deterministic deck shuffle.
- * IMPORTANT: uses only the provided seedSource (no timestamp/random parts) so same seed => same deck.
+ * Uses only the provided seedSource so same seed => same deck.
  */
 function generateShuffledDeck(seedSource: string | null) {
   const deck: { value: string; suit: { symbol: string; color: string } }[] = [];
@@ -137,14 +139,11 @@ export default function Home() {
   const currentUser = localPlayerId ? players[localPlayerId] : null;
 
   /**
-   * FIX: myPrivateHand must remain fixed for the whole hand.
-   * - seed depends ONLY on localPlayerId and gameState.gameId.
-   * - Use gameState?.timestamp only as a safety guard to avoid early toString/undefined issues during load.
+   * Stable private hand: ONLY depends on localPlayerId and gameState.gameId
    */
   const myPrivateHand = useMemo(() => {
     if (!gameState || !localPlayerId) return [];
-    // safety: ensure the state has loaded sufficiently (timestamp prevents early crashes)
-    if (!gameState.timestamp || !gameState.gameId) return [];
+    if (!gameState.gameId) return [];
     const count = gameState.handCardsCount || 5;
     const p = players[localPlayerId];
     if (p?.privateHand && Array.isArray(p.privateHand) && p.privateHand.length >= count) {
@@ -154,7 +153,7 @@ export default function Home() {
     const deck = generateShuffledDeck(seed);
     return deck.slice(0, count).map((c) => ({ value: c.value, suit: c.suit, color: c.color }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [gameState?.handCardsCount, gameState?.gameId, gameState?.timestamp, localPlayerId, players]);
+  }, [gameState?.handCardsCount, gameState?.gameId, localPlayerId, players]);
 
   /**
    * Firebase listeners
@@ -191,19 +190,32 @@ export default function Home() {
   }, [isConnected, localPlayerId]);
 
   /**
-   * When revealedCards change -> discard ALL matching-value cards from players' hands.
-   * This implements multi-discard: if a player has multiple cards of that value, all are removed.
+   * Helper to compute the set of values considered "revealed" for discard purposes.
+   * Rule: if any of 10/J/Q/K is present among revealed, treat the whole group {10,J,Q,K} as revealed.
+   */
+  const computeRevealedValueSet = (revealed: CardType[] | undefined) => {
+    const set = new Set<string>((revealed || []).map((c) => c.value));
+    // If any of the 10-group is present, treat all as present for discard
+    const faceGroup = ["10", "J", "Q", "K"];
+    if (faceGroup.some((v) => set.has(v))) {
+      faceGroup.forEach((v) => set.add(v));
+    }
+    return set;
+  };
+
+  /**
+   * When revealedCards change -> discard matching-value cards from players' hands (behind the scenes).
+   * No logs or messages should reveal which specific cards were removed from players' hands.
    */
   useEffect(() => {
     if (!gameState) return;
     const revealed = gameState.revealedCards || [];
     const prevLen = prevRevealedRef.current;
     if (revealed.length !== prevLen) {
-      // run full-scan discard based on all currently revealed values
       discardMatchingCardsAgainstTable();
     }
     prevRevealedRef.current = revealed.length;
-  }, [gameState?.revealedCards]); // trigger when revealedCards array changes
+  }, [gameState?.revealedCards]);
 
   /**
    * Join / Admin login
@@ -227,6 +239,8 @@ export default function Home() {
       hasActed: false,
       privateHand: null,
       declaredCount: null,
+      folded: false,
+      lastAction: "",
     });
   };
 
@@ -248,6 +262,8 @@ export default function Home() {
         hasActed: false,
         privateHand: null,
         declaredCount: null,
+        folded: false,
+        lastAction: "",
       });
     } else {
       toast({ title: "Sistema Protetto", description: "Password errata.", variant: "destructive" });
@@ -256,6 +272,8 @@ export default function Home() {
 
   /**
    * Admin actions: delete players and history
+   * FIX CRASH: ensure gameId is never undefined. Use empty string so Firebase accepts the value.
+   * Also remove players and history as requested.
    */
   const deletePlayersAndHistory = () => {
     db.ref("game/players").remove();
@@ -267,8 +285,10 @@ export default function Home() {
       revealedCards: [],
       totalCards: 5,
       handCardsCount: 5,
+      adminId: "",
+      dealerIndex: 0,
       lastAction: "CANCELLA GIOCATORI E CRONOLOGIA",
-      gameId: undefined,
+      gameId: "", // explicit empty string instead of undefined
       timestamp: Date.now(),
     });
     setPlayers({});
@@ -276,11 +296,15 @@ export default function Home() {
     toast({ title: "Sistema", description: "Giocatori e cronologia cancellati." });
   };
 
+  /**
+   * Add bot: creates a player with isBot: true. No logs about their cards.
+   */
   const addBot = (name?: string) => {
     const r = db.ref("game/players").push();
     const pos = Object.keys(players).length;
+    const botId = r.key!;
     r.set({
-      id: r.key,
+      id: botId,
       username: name || `BOT_${Math.floor(Math.random() * 9000) + 1000}`,
       balance: 200,
       isBot: true,
@@ -290,7 +314,10 @@ export default function Home() {
       hasActed: false,
       privateHand: null,
       declaredCount: null,
+      folded: false,
+      lastAction: "",
     });
+    toast({ title: "Bot aggiunto", description: `${name || "BOT"} creato` });
   };
 
   const setManualDealer = (id: string) => {
@@ -300,6 +327,7 @@ export default function Home() {
 
   /**
    * Assign Las Vegas: assign entire pot to player and reset pot
+   * update player's lastAction generically (no card info).
    */
   const assignLasVegas = (playerId: string) => {
     if (!gameState) return;
@@ -312,6 +340,7 @@ export default function Home() {
     if (!p) return;
     const updates: any = {};
     updates[`game/players/${p.id}/balance`] = parseFloat((p.balance + pot).toFixed(2));
+    updates[`game/players/${p.id}/lastAction`] = `LAS VEGAS +${pot.toFixed(2)}€`;
     db.ref().update(updates);
     db.ref("game/history").push({ winners: `${p.username} (LAS VEGAS)`, pot, timestamp: Date.now() });
     db.ref("game/state").update({ pot: 0, lastAction: `ASSEGNA LAS VEGAS a ${p.username}`, timestamp: Date.now() });
@@ -320,6 +349,7 @@ export default function Home() {
 
   /**
    * Start game: assign private hands to players and set gameId (stable per hand)
+   * Also resets folded flag and lastAction for all players.
    */
   const startGame = (totalCards: number, handCards: number) => {
     const gameId = generateGameId();
@@ -345,6 +375,8 @@ export default function Home() {
       updates[`game/players/${id}/choice`] = null;
       updates[`game/players/${id}/hasActed`] = false;
       updates[`game/players/${id}/declaredCount`] = null;
+      updates[`game/players/${id}/folded`] = false; // reset folded at new hand
+      updates[`game/players/${id}/lastAction`] = "";
       const seed = `${id}-${gameId}`; // stable per hand
       const deck = generateShuffledDeck(seed);
       updates[`game/players/${id}/privateHand`] = deck.slice(0, handCards);
@@ -352,19 +384,24 @@ export default function Home() {
     db.ref().update(updates);
   };
 
-  const initRound = (commonCards: 3 | 5) => {
+  // initRound accepts only 4,5,6 (no 3)
+  const initRound = (commonCards: 4 | 5 | 6) => {
     const handCardsDefault = gameState?.handCardsCount || 5;
     startGame(commonCards, handCardsDefault);
   };
 
   /**
    * Discard: remove any cards in players' privateHand whose value appears on the table (revealedCards).
-   * This removes multiple duplicates as requested.
+   * This happens behind the scenes: no messages revealing which cards were removed.
+   *
+   * Rule: if any of {10,J,Q,K} is on table, consider the whole group present for discard.
    */
   const discardMatchingCardsAgainstTable = () => {
     if (!gameState) return;
     const revealed = gameState.revealedCards || [];
-    const revealedValues = new Set(revealed.map((c) => c.value));
+
+    const revealedValues = computeRevealedValueSet(revealed);
+
     if (revealedValues.size === 0) return;
 
     const updates: any = {};
@@ -376,24 +413,60 @@ export default function Home() {
         if (p.declaredCount !== undefined && p.declaredCount !== null && p.declaredCount > filtered.length) {
           updates[`game/players/${p.id}/declaredCount`] = filtered.length;
         }
+        // Do NOT set any per-player textual message about what was discarded.
+        // Do NOT set game/state lastAction indicating discard details.
       }
     });
 
     if (Object.keys(updates).length > 0) {
       db.ref().update(updates);
-      db.ref("game/state").update({ lastAction: `Scarto automatico per valori: ${Array.from(revealedValues).join(", ")}`, timestamp: Date.now() });
+      // Do not write any "scarto" messages to game/state or players.
+      // We may update a timestamp only if needed; omitted to preserve privacy.
     }
   };
 
   /**
+   * Helper: get next active (non-folded) player id after given playerId
+   */
+  const getNextActivePlayerId = (afterPlayerId: string | null) => {
+    const playerList = Object.values(players).sort((a, b) => a.position - b.position);
+    if (playerList.length === 0) return "";
+    const startIndex = afterPlayerId ? Math.max(0, playerList.findIndex((p) => p.id === afterPlayerId)) : -1;
+    for (let i = 1; i <= playerList.length; i++) {
+      const idx = (startIndex + i) % playerList.length;
+      const candidate = playerList[idx];
+      if (!candidate.folded) return candidate.id;
+    }
+    return ""; // no active players found
+  };
+
+  /**
    * Reveal next card
+   *
+   * Ensures all revealed card VALUES on the table are unique.
+   * Picks a value not already present on the table; chooses a random suit for it.
+   * No console logs about missing values to avoid revealing internal state.
    */
   const revealNextCard = () => {
     if (!gameState) return;
+
+    const currentRevealed = gameState.revealedCards || [];
+    const existingValues = new Set(currentRevealed.map((c) => c.value));
+
+    // available values = values not yet on the table
+    const availableValues = VALUES.filter((v) => !existingValues.has(v));
+
+    if (availableValues.length === 0) {
+      // nothing to reveal (shouldn't happen for 4/5/6), silently skip
+      return;
+    }
+
+    // pick a random unique value
+    const value = availableValues[Math.floor(Math.random() * availableValues.length)];
     const suit = SUITS[Math.floor(Math.random() * SUITS.length)];
-    const value = VALUES[Math.floor(Math.random() * VALUES.length)];
     const nextCard: CardType = { value, suit: suit.symbol, color: suit.color };
-    const nextRevealed = [...(gameState.revealedCards || []), nextCard];
+    const nextRevealed = [...currentRevealed, nextCard];
+
     const playerList = Object.values(players).sort((a, b) => a.position - b.position);
 
     db.ref("game/state").update({
@@ -402,12 +475,11 @@ export default function Home() {
       currentBet: 0,
       dealerIndex: (gameState.dealerIndex + 1) % Math.max(1, playerList.length),
       currentPlayerTurn: "",
-      lastAction: `Carta rivelata: ${value}${suit.symbol}`,
+      lastAction: `Carta rivelata: ${value}${suit.symbol}`, // display of table card is allowed
       timestamp: Date.now(),
     });
 
-    // apply discard based on the full table values
-    // (the effect above will also trigger discardMatchingCardsAgainstTable via listener; this ensures immediate reaction)
+    // apply discard immediately (behind the scenes)
     discardMatchingCardsAgainstTable();
 
     const updates: any = {};
@@ -420,10 +492,7 @@ export default function Home() {
   };
 
   /**
-   * Reset hand admin:
-   * - clear pot and revealedCards
-   * - generate a new gameId so next hand yields new private hands
-   * - do NOT delete players
+   * Reset hand admin (keeps players)
    */
   const resetHandAdmin = () => {
     const newGameId = generateGameId();
@@ -442,16 +511,22 @@ export default function Home() {
       updates[`game/players/${id}/hasActed`] = false;
       updates[`game/players/${id}/declaredCount`] = null;
       updates[`game/players/${id}/privateHand`] = null; // cleared so startGame will reassign based on new gameId
+      updates[`game/players/${id}/folded`] = false; // reset folded
+      updates[`game/players/${id}/finalScore`] = null;
+      updates[`game/players/${id}/choice`] = null;
+      updates[`game/players/${id}/lastAction`] = "";
     });
     db.ref().update(updates);
     toast({ title: "Reset mano", description: "Piatto e carte a terra azzerati. Nuovo gameId creato." });
   };
 
   /**
-   * Bets and checks
+   * Bets, checks and fold
+   * lastAction set generically (never contains card values)
    */
   const handleBet = () => {
     if (!gameState || !currentUser || gameState.currentPlayerTurn !== localPlayerId) return;
+    if (currentUser.folded) return;
     const betVal = parseFloat(Math.max(0.1, Math.min(2.0, betAmount)).toFixed(2));
     const diff = parseFloat((betVal - currentUser.lastBet).toFixed(2));
     if (diff > currentUser.balance) {
@@ -466,30 +541,36 @@ export default function Home() {
     }
     updates[`game/players/${localPlayerId}/balance`] = parseFloat((currentUser.balance - diff).toFixed(2));
     updates[`game/players/${localPlayerId}/lastBet`] = betVal;
+    updates[`game/players/${localPlayerId}/lastAction`] = `Ha puntato €${betVal.toFixed(2)}`;
 
-    const playerList = Object.values(players).sort((a, b) => a.position - b.position);
-    const currentIndex = playerList.findIndex((p) => p.id === localPlayerId);
-    if (currentIndex === -1) {
-      db.ref().update(updates);
-      db.ref("game/state").update({ pot: parseFloat((gameState.pot + diff).toFixed(2)), currentBet: betVal, timestamp: Date.now() });
-      return;
-    }
-    const nextIndex = (currentIndex + 1) % playerList.length;
     db.ref().update(updates);
+    const nextId = getNextActivePlayerId(localPlayerId);
     db.ref("game/state").update({
       pot: parseFloat((gameState.pot + diff).toFixed(2)),
       currentBet: betVal,
-      currentPlayerTurn: playerList[nextIndex].id,
+      currentPlayerTurn: nextId,
       timestamp: Date.now(),
     });
   };
 
   const handleCheck = () => {
     if (!gameState || !currentUser || gameState.currentPlayerTurn !== localPlayerId) return;
-    const playerList = Object.values(players).sort((a, b) => a.position - b.position);
-    const nextIndex = (playerList.findIndex((p) => p.id === localPlayerId) + 1) % playerList.length;
-    db.ref(`game/players/${localPlayerId}`).update({ hasActed: true });
-    db.ref("game/state").update({ currentPlayerTurn: playerList[nextIndex].id, timestamp: Date.now() });
+    if (currentUser.folded) return;
+    db.ref(`game/players/${localPlayerId}`).update({ hasActed: true, lastAction: "Check" });
+    const nextId = getNextActivePlayerId(localPlayerId);
+    db.ref("game/state").update({ currentPlayerTurn: nextId, timestamp: Date.now() });
+  };
+
+  const handleFold = () => {
+    if (!gameState || !currentUser || gameState.currentPlayerTurn !== localPlayerId) return;
+    if (currentUser.folded) return;
+    const updates: any = {};
+    updates[`game/players/${localPlayerId}/folded`] = true;
+    updates[`game/players/${localPlayerId}/hasActed`] = true;
+    updates[`game/players/${localPlayerId}/lastAction`] = "Fold";
+    db.ref().update(updates);
+    const nextId = getNextActivePlayerId(localPlayerId);
+    db.ref("game/state").update({ currentPlayerTurn: nextId, timestamp: Date.now(), lastAction: `Player ${currentUser.username} folded` });
   };
 
   /**
@@ -535,7 +616,7 @@ export default function Home() {
     });
     if (Object.keys(updates).length > 0) db.ref().update(updates);
 
-    const playerList = Object.values(players).filter((p) => p.choice && p.finalScore !== undefined);
+    const playerList = Object.values(players).filter((p) => !p.folded && p.choice && p.finalScore !== undefined);
     const pot = gameState.pot;
     const winnerUpdates: any = {};
     const winnersInfo: string[] = [];
@@ -593,10 +674,25 @@ export default function Home() {
   const returnToLobby = () => db.ref("game/state").update({ phase: "lobby" });
 
   /**
-   * Render
-   * - Cards (table & hand) use white background with clear black/red text.
-   * - Players list box contains only: Name, Balance, optional 'PRONTO' badge and LAS VEGAS button.
-   * - RESET MANO exists and creates a new gameId and clears table/pot but keeps players.
+   * UI-level: compute revealed set (with face-group) to filter visible hand
+   * - The visual disappearance is applied only to the current player's displayed hand.
+   * - All discard operations on privateHand are performed server-side and silently.
+   */
+  const revealedValueSet = useMemo(() => {
+    const vals = computeRevealedValueSet(gameState?.revealedCards || []);
+    return vals;
+  }, [gameState?.revealedCards]);
+
+  const visibleMyHand = useMemo(() => {
+    const hand = currentUser?.privateHand && Array.isArray(currentUser.privateHand) ? currentUser.privateHand : myPrivateHand;
+    if (!hand || hand.length === 0) return [];
+    return hand.filter((c) => !revealedValueSet.has(c.value));
+  }, [currentUser?.privateHand, myPrivateHand, revealedValueSet]);
+
+  /**
+   * Render (UI unchanged visually).
+   * Under each player's name we display only lastAction (bets/check/fold/lasvegas),
+   * and never any card values. Discard messages removed entirely.
    */
   if (!isInitialized) {
     return (
@@ -641,7 +737,7 @@ export default function Home() {
             </span>
           </div>
           {currentUser && (
-            <Button variant="outline" onClick={() => { if (localPlayerId) db.ref(`game/players/${localPlayerId}`).remove(); handleLogout(); }} className="border-red-900/30 text-red-500 hover:bg-red-500 hover:text-white font-black rounded-xl px-6 transition-all">
+            <Button variant="outline" onClick={() => { if (localPlayerId) db.ref(`game/players/${localPlayerId}`).remove(); handleLogout(); }} className="border-red-900/30 text-red-500 hover:bg-red-50/5">
               ESCI
             </Button>
           )}
@@ -662,7 +758,7 @@ export default function Home() {
                 <Input placeholder="IL TUO NICKNAME" className="h-14 bg-black/40 border-white/5 text-center font-black italic text-xl rounded-2xl" value={tempName} onChange={e => setTempName((e.target as HTMLInputElement).value)} />
                 <Input type="password" placeholder="PASSWORD" className="h-14 bg-black/40 border-white/5 text-center text-xl rounded-2xl" value={adminPassword} onChange={e => setAdminPassword((e.target as HTMLInputElement).value)} />
                 <Input type="number" placeholder="BUDGET €" className="h-14 bg-black/40 border-white/5 text-center text-xl font-black rounded-2xl" value={budgetInput} onChange={e => setBudgetInput((e.target as HTMLInputElement).value)} />
-                <Button onClick={tempName.toLowerCase() === 'diro' ? handleAdminLogin : joinGame} className={`w-full h-16 ${tempName.toLowerCase() === 'diro' ? 'bg-[#D4AF37]' : 'bg-[#50C878]'} text-black font-black rounded-2xl text-lg`}>
+                <Button onClick={tempName.toLowerCase() === 'diro' ? handleAdminLogin : joinGame} className={`w-full h-16 ${tempName.toLowerCase() === 'diro' ? 'bg-[#D4AF37]' : 'bg-[#50C878]'} text-black font-black uppercase rounded-2xl`}>
                   {tempName.toLowerCase() === 'diro' ? 'ACCEDI COME BOSS' : 'GIOCA ORA'}
                 </Button>
               </div>
@@ -671,36 +767,41 @@ export default function Home() {
 
           {/* admin panel */}
           {isAdminMode && (
-            <Card className="bg-black/90 border-[#D4AF37] border-2 shadow-[0_0_50px_rgba(212,175,55,0.1)] p-5 rounded-[30px]">
-              <div className="flex items-center gap-2 mb-6 border-b border-[#D4AF37]/20 pb-4">
-                <Settings2 className="w-5 h-5 text-[#D4AF37]" />
-                <span className="font-black text-xs uppercase italic text-[#D4AF37]">Pannello di Controllo Boss</span>
-              </div>
-              <div className="space-y-4">
+            <Card className="bg-black/90 border-[#D4AF37] border-2 shadow-[0_0_50px_rgba(212,175,55,0.1)] p-5 rounded-[30px] overflow-hidden">
+              <div className="flex flex-col gap-4">
+                <div className="flex items-center gap-2 mb-2 border-b border-[#D4AF37]/20 pb-2">
+                  <Settings2 className="w-5 h-5 text-[#D4AF37]" />
+                  <span className="font-black text-xs uppercase italic text-[#D4AF37]">Pannello di Controllo Boss</span>
+                </div>
+
                 <div>
                   <label className="text-[9px] text-white/30 font-black uppercase ml-1">Configurazione Round</label>
                   <div className="grid grid-cols-3 gap-2 mt-2">
                     {[5,6,7].map(n => (
-                      <Button key={n} onClick={() => startGame(gameState?.totalCards || 5, n)} className={`h-10 text-[10px] font-black rounded-lg ${gameState?.handCardsCount === n ? 'bg-[#D4AF37] text-black' : 'bg-white/5'}`}>
+                      <Button key={n} onClick={() => startGame(gameState?.totalCards || 5, n)} className={`h-10 text-[10px] font-black rounded-lg ${gameState?.handCardsCount === n ? 'bg-[#D4AF37] text-black' : 'bg-black/40 text-white'} w-full`}>
                         {n} CARTE
                       </Button>
                     ))}
                   </div>
+
                   <div className="grid grid-cols-3 gap-2 mt-2">
-                    {[3,4,5].map(n => (
-                      <Button key={n} onClick={() => startGame(n, gameState?.handCardsCount || 5)} className={`h-10 text-[10px] font-black rounded-lg ${gameState?.totalCards === n ? 'bg-[#D4AF37] text-black' : 'bg-white/5'}`}>
+                    {[4,5,6].map(n => (
+                      <Button key={n} onClick={() => startGame(n, gameState?.handCardsCount || 5)} className={`h-10 text-[10px] font-black rounded-lg ${gameState?.totalCards === n ? 'bg-[#D4AF37] text-black' : 'bg-black/40 text-white'} w-full`}>
                         {n} A TERRA
                       </Button>
                     ))}
                   </div>
                 </div>
 
-                <Button onClick={revealNextCard} disabled={gameState?.phase !== 'betting'} className="w-full h-14 bg-gradient-to-r from-[#D4AF37] to-[#996515] text-black font-black text-sm uppercase italic rounded-xl">
-                  PROSSIMA CARTA
-                </Button>
+                <div className="flex flex-col gap-2">
+                  <Button onClick={revealNextCard} disabled={gameState?.phase !== 'betting'} className="w-full h-12 bg-gradient-to-r from-[#D4AF37] to-[#996515] text-black font-black text-sm uppercase">PROSSIMA CARTA</Button>
+                  <Button onClick={() => addBot()} className="w-full h-12 bg-[#50C878] text-black font-black text-sm uppercase">AGGIUNGI BOT</Button>
+                  <Button onClick={resetHandAdmin} className="w-full h-12 bg-[#D4AF37] text-black font-black uppercase">RESET MANO</Button>
+                  <Button onClick={deletePlayersAndHistory} variant="destructive" className="w-full h-12 text-white font-black uppercase">CANCELLA TUTTI</Button>
+                </div>
 
-                <div className="pt-4 space-y-2">
-                  <p className="text-[8px] text-white/20 text-center uppercase font-black">Assegna Dealer</p>
+                <div>
+                  <p className="text-[8px] text-white/20 text-center uppercase font-black mb-2">Assegna Dealer</p>
                   <div className="flex flex-wrap gap-1 justify-center">
                     {Object.values(players).map(p => (
                       <Button key={p.id} onClick={() => setManualDealer(p.id)} variant="ghost" className="h-6 px-3 text-[9px] font-bold border border-white/5 rounded-full">
@@ -708,11 +809,6 @@ export default function Home() {
                       </Button>
                     ))}
                   </div>
-                </div>
-
-                <div className="pt-6">
-                  <Button onClick={resetHandAdmin} className="h-12 w-full bg-[#D4AF37] text-black font-black uppercase mb-2">RESET MANO</Button>
-                  <Button onClick={deletePlayersAndHistory} variant="destructive" className="h-12 w-full text-white font-black uppercase">CANCELLA GIOCATORI</Button>
                 </div>
               </div>
             </Card>
@@ -793,11 +889,13 @@ export default function Home() {
               })}
             </div>
 
-            {/* player's private cards: white rectangles with black/red text; stable per gameId */}
-            {myPrivateHand.length > 0 && (
+            {/* player's private cards: white rectangles with black/red text; stable per gameId
+                Filtered in real-time: cards whose value is present on table are not rendered (they "disappear" from UI)
+            */}
+            {visibleMyHand.length > 0 && (
               <div className="absolute left-1/2 -translate-x-1/2 bottom-6 z-30 pointer-events-none">
                 <div className="flex items-end -space-x-3">
-                  {myPrivateHand.map((card, i) => (
+                  {visibleMyHand.map((card, i) => (
                     <motion.div
                       key={i}
                       initial={{ opacity: 0, y: 20, scale: 0.95 }}
@@ -821,62 +919,71 @@ export default function Home() {
             </div>
           </div>
 
-          {/* actions area */}
+          {/* actions area - responsive flex-wrap layout */}
           <AnimatePresence mode="wait">
-            {gameState?.phase === "betting" && currentUser && gameState.currentPlayerTurn === localPlayerId && (
-              <motion.div initial={{ opacity: 0, y: 50 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, scale: 0.9 }} className="bg-zinc-900 border-2 border-[#D4AF37] rounded-[50px] p-10 shadow-2xl relative">
-                <div className="absolute top-0 right-0 p-4"><Zap className="w-10 h-10 text-[#D4AF37] opacity-10 animate-pulse" /></div>
-                <div className="flex flex-col md:flex-row gap-12 items-center">
-                  <div className="flex-1 w-full space-y-8">
-                    <div className="flex justify-between items-end">
-                      <div className="flex flex-col">
-                        <span className="text-[11px] font-black uppercase text-[#D4AF37] tracking-[0.4em]">Stai Puntando</span>
-                        <span className="text-6xl font-black italic text-white tabular-nums">{betAmount.toFixed(2)}€</span>
-                      </div>
-                      <div className="text-right">
-                        <span className="text-[11px] font-black uppercase text-white/30 block mb-1">Budget dopo puntata</span>
-                        <span className="text-2xl font-black italic text-[#50C878]">{(currentUser.balance - (betAmount - currentUser.lastBet)).toFixed(2)}€</span>
-                      </div>
+            {gameState?.phase === "betting" && currentUser && gameState.currentPlayerTurn === localPlayerId && !currentUser.folded && (
+              <motion.div initial={{ opacity: 0, y: 50 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, scale: 0.9 }} className="bg-zinc-900 border-2 border-[#D4AF37] rounded-[24px] p-4 shadow-2xl relative">
+                <div className="absolute top-0 right-0 p-3"><Zap className="w-8 h-8 text-[#D4AF37] opacity-10 animate-pulse" /></div>
+
+                <div className="flex flex-wrap gap-2 justify-center items-center">
+                  <div className="flex-1 min-w-[220px]">
+                    <div className="flex flex-col">
+                      <span className="text-[11px] font-black uppercase text-[#D4AF37] tracking-[0.4em]">Stai Puntando</span>
+                      <span className="text-3xl md:text-6xl font-black italic text-white tabular-nums">{betAmount.toFixed(2)}€</span>
+                      <span className="text-[11px] font-black uppercase text-white/30 block mt-1">Budget dopo puntata</span>
+                      <span className="text-lg md:text-2xl font-black italic text-[#50C878]">{(currentUser.balance - (betAmount - currentUser.lastBet)).toFixed(2)}€</span>
                     </div>
-                    <Slider value={[betAmount]} onValueChange={v => setClampedBet(v[0])} min={0.10} max={2.00} step={0.10} className="py-8" />
+                    <div className="mt-3">
+                      <Slider value={[betAmount]} onValueChange={v => setClampedBet(v[0])} min={0.10} max={2.00} step={0.10} className="py-2" />
+                    </div>
                   </div>
-                  <div className="flex gap-4 w-full md:w-auto">
-                    <Button onClick={handleCheck} disabled={currentUser.lastBet !== gameState.currentBet} className="h-24 flex-1 px-12 bg-black/50 border-2 border-white/10 text-white font-black italic uppercase rounded-3xl">CHECK</Button>
-                    <Button onClick={handleBet} className="h-24 flex-1 px-12 bg-[#50C878] text-black font-black italic uppercase rounded-3xl shadow-2xl text-3xl">PUNTA</Button>
+
+                  <div className="flex flex-wrap gap-2 justify-center flex-1">
+                    <Button onClick={handleCheck} disabled={currentUser.lastBet !== gameState.currentBet} className="min-w-[80px] text-xs h-10 px-3 flex items-center justify-center">CHECK</Button>
+                    <Button onClick={handleFold} className="min-w-[80px] text-xs h-10 px-3 flex items-center justify-center bg-red-600 text-black">FOLD</Button>
+                    <Button onClick={handleBet} className="min-w-[80px] text-xs md:text-sm h-10 px-3 flex items-center justify-center bg-[#50C878] text-black font-black">PUNTA</Button>
                   </div>
                 </div>
               </motion.div>
             )}
 
-            {gameState?.phase === "declaring" && currentUser && (currentUser.declaredCount === undefined || currentUser.declaredCount === null) && (
-              <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="bg-zinc-900 border-2 border-[#D4AF37] rounded-[40px] p-8 shadow-2xl text-center">
+            {gameState?.phase === "declaring" && currentUser && (currentUser.declaredCount === undefined || currentUser.declaredCount === null) && !currentUser.folded && (
+              <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="bg-zinc-900 border-2 border-[#D4AF37] rounded-[40px] p-6 shadow-2xl text-center">
                 <h3 className="text-2xl font-black text-white uppercase mb-2">DICHIARA LE CARTE</h3>
                 <p className="text-sm text-white/40 mb-4">Inserisci quante carte hai (dopo gli scarti automatici)</p>
-                <div className="flex items-center justify-center gap-4">
-                  <Input type="number" min={0} max={gameState?.handCardsCount || 5} value={declareCountInput as any} onChange={e => setDeclareCountInput(e.target.value === "" ? "" : Math.max(0, Math.min(gameState?.handCardsCount || 5, parseInt((e.target as HTMLInputElement).value))))} className="h-14 w-40 text-center text-xl font-black" />
-                  <Button onClick={() => typeof declareCountInput === "number" && submitDeclaration(declareCountInput)} className="h-14 bg-[#D4AF37] text-black font-black px-6 rounded-lg">DICHIARA</Button>
+                <div className="flex flex-wrap gap-3 items-center justify-center">
+                  <Input type="number" min={0} max={gameState?.handCardsCount || 5} value={declareCountInput as any} onChange={e => setDeclareCountInput(e.target.value === "" ? "" : Math.max(0, Math.min(gameState?.handCardsCount || 5, Number(e.target.value))))} />
+                  <Button onClick={() => typeof declareCountInput === "number" && submitDeclaration(declareCountInput)} className="h-12 bg-[#D4AF37] text-black font-black px-4 rounded-lg">DICHIARA</Button>
                 </div>
               </motion.div>
             )}
 
-            {gameState?.phase === "final" && currentUser && !currentUser.choice && (
-              <motion.div initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} className="bg-zinc-900 border-4 border-zinc-800 rounded-[60px] p-12 text-center space-y-10 mx-auto w-full max-w-3xl">
+            {gameState?.phase === "final" && currentUser && !currentUser.choice && !currentUser.folded && (
+              <motion.div initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} className="bg-zinc-900 border-4 border-zinc-800 rounded-[40px] p-6 text-center space-y-6 mx-auto w-full max-w-3xl">
                 <div className="space-y-2">
-                  <h2 className="text-6xl font-black italic uppercase tracking-tighter text-white">SCEGLI MIN O MAX</h2>
+                  <h2 className="text-4xl md:text-6xl font-black italic uppercase tracking-tighter text-white">SCEGLI MIN O MAX</h2>
                   <p className="text-xs text-white/40 font-black uppercase tracking-[0.5em]">L'Asso vale 1 per MIN e 11 per MAX</p>
                 </div>
-                <div className="flex gap-8 justify-center">
-                  <Button onClick={() => submitFinal("min")} className="flex-1 h-20 bg-zinc-800 text-white font-black text-2xl rounded-[30px] hover:bg-zinc-700">MIN</Button>
-                  <Button onClick={() => submitFinal("max")} className="flex-1 h-20 bg-zinc-800 text-white font-black text-2xl rounded-[30px] hover:bg-zinc-700">MAX</Button>
+                <div className="grid grid-cols-2 md:grid-cols-2 gap-3">
+                  <Button onClick={() => submitFinal("min")} className="h-12 md:h-20 bg-zinc-800 text-white font-black text-lg rounded-[12px]">MIN</Button>
+                  <Button onClick={() => submitFinal("max")} className="h-12 md:h-20 bg-zinc-800 text-white font-black text-lg rounded-[12px]">MAX</Button>
                 </div>
               </motion.div>
             )}
           </AnimatePresence>
 
-          {/* players list - cleaned: only Name, Balance, optional PRONTO badge, LAS VEGAS button */}
+          {/* players list - show only lastAction under name (no discard messages, no card info) */}
           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-6 w-full pb-20">
             {Object.values(players).sort((a, b) => a.position - b.position).map((p) => {
               const isMe = p.id === localPlayerId;
+              const actionLabel = p.lastAction
+                ? p.lastAction
+                : p.lastBet > 0
+                ? `Ha puntato €${p.lastBet.toFixed(2)}`
+                : p.folded
+                ? "Stato: Folded"
+                : "In attesa";
+
               return (
                 <motion.div key={p.id} layout className={`p-6 rounded-[40px] border-2 relative transition-all duration-500 ${isMe ? 'border-[#D4AF37] bg-[#D4AF37]/5' : 'border-white/5 bg-black/20'}`}>
                   {/* dealer indicator */}
@@ -884,7 +991,7 @@ export default function Home() {
                     <div className="absolute -top-3 -left-3 w-14 h-14 bg-gradient-to-br from-[#D4AF37] to-[#996515] rounded-2xl flex items-center justify-center text-black font-black text-2xl shadow-xl">D</div>
                   )}
 
-                  <div className="flex flex-col items-center text-center space-y-4">
+                  <div className="flex flex-col items-center text-center space-y-3">
                     <div className="flex flex-col items-center gap-1">
                       <div className="flex items-center gap-2">
                         {p.isAdmin && <Crown className="w-4 h-4 text-[#D4AF37]" />}
@@ -893,15 +1000,19 @@ export default function Home() {
 
                       <div className="text-3xl font-black italic tabular-nums text-white">{p.balance.toFixed(2)}€</div>
 
-                      {p.hasActed === false && (
+                      <div className="text-[10px] text-white/40">{actionLabel}</div>
+
+                      {p.hasActed === false && !p.folded && (
                         <Badge className="bg-[#50C878]/10 text-[#50C878] border-[#50C878]/20 font-black text-[9px] uppercase">PRONTO</Badge>
+                      )}
+
+                      {p.folded && (
+                        <Badge className="bg-red-700/10 text-red-300 border-red-700/20 font-black text-[9px] uppercase">FOLDED</Badge>
                       )}
                     </div>
 
-                    {/* we intentionally do NOT show any card icons here (clean UI) */}
-
                     <div className="w-full flex justify-center mt-3">
-                      <Button onClick={() => assignLasVegas(p.id)} disabled={!isAdminMode} className="h-9 text-[11px] px-3 font-black uppercase">
+                      <Button onClick={() => assignLasVegas(p.id)} disabled={!isAdminMode} className="h-9 w-full max-w-[160px] text-[11px] px-3 font-black uppercase">
                         LAS VEGAS
                       </Button>
                     </div>
@@ -938,7 +1049,7 @@ export default function Home() {
               </div>
               <div className="p-10 bg-black/50">
                 {isAdminMode ? (
-                  <Button onClick={returnToLobby} className="w-full h-20 bg-[#D4AF37] text-black font-black uppercase text-2xl italic shadow-2xl hover:brightness-110 active:scale-95 transition-all rounded-xl">
+                  <Button onClick={returnToLobby} className="w-full h-20 bg-[#D4AF37] text-black font-black uppercase text-2xl italic shadow-2xl hover:brightness-110 active:scale-95 transition-all rounded-2xl">
                     AVVIA NUOVA MANO
                   </Button>
                 ) : (
