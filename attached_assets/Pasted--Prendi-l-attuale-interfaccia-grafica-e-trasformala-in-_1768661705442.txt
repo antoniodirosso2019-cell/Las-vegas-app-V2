@@ -1,0 +1,47 @@
+"Prendi l'attuale interfaccia grafica e trasformala in un'app di gioco reale e sincronizzata. Segui queste istruzioni tecniche precise:
+
+1. Sincronizzazione Database (Firebase): L'app deve essere collegata in tempo reale al mio database Firebase. Ogni azione deve riflettersi istantaneamente su tutti i dispositivi.
+
+Configurazione:
+
+apiKey: "AIzaSyBwTXt8sOhNfW2lzu7430g4wcHn9dTMZeA"
+
+databaseURL: "https://las-vegas-poker-f2d6a-default-rtdb.europe-west1.firebasedatabase.app"
+
+projectId: "las-vegas-poker-f2d6a"
+
+2. Login Admin & Gestione Giocatori:
+
+Io sono Antonio. Se effettuo il login con Password 1234, sblocca il pannello di controllo completo.
+
+Aggiungi un tasto 'CANCELLA GIOCATORI' che svuota istantaneamente la lista utenti nel database.
+
+Aggiungi il tasto 'AGGIUNGI 4 BOT' che crea bot che seguono automaticamente le puntate dell'admin.
+
+3. Il Tappetino e le Carte (Visual Mat):
+
+Al centro dell'app deve esserci il tappetino verde.
+
+Le carte (4, 5 o 6 a scelta) devono essere visualizzate graficamente.
+
+All'inizio sono tutte coperte. Solo l'Admin può cliccare su 'SCOPRI CARTA' per girarne una alla volta, attivando una nuova fase di puntata per tutti.
+
+4. Regole Scommesse (Vincolo Antonio):
+
+Per ogni turno di puntata, ogni giocatore deve avere uno Slider (input range).
+
+LIMITI: Minimo 0.10€, Massimo 2.00€, Step 0.10€. Non deve essere possibile scommettere più di 2 euro.
+
+5. Reset Totale e Cronologia:
+
+Il tasto di Reset (o 'SYSTEM WIPE') deve azzerare la partita e CANCELLARE DEFINITIVAMENTE la cronologia delle vincite (betHistory) dal database. Non deve rimanere traccia delle sessioni passate.
+
+6. Fase Finale MIN/MAX:
+
+Quando tutte le carte sono scoperte, mostra a tutti i pulsanti 'GIOCA PER IL MIN' e 'GIOCA PER IL MAX'.
+
+Ogni giocatore inserisce il proprio punteggio numerico.
+
+Il sistema calcola chi ha il punteggio più basso (vince metà piatto) e chi ha il più alto (vince l'altra metà).
+
+Aggiorna il file App.js con questo codice completo e assicurati che non ci siano errori di icone (usa lucide-react)."
