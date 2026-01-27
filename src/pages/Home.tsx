@@ -1,46 +1,32 @@
-import { useState, useEffect, useMemo, useRef } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { useFirebaseConnection } from "@/hooks/use-firebase-connection";
 import { db } from "@/lib/firebase";
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
 import { Input } from "@/components/ui/input";
-import { Card } from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { useToast } from "@/hooks/use-toast";
 import {
   Trophy,
   History,
-  Zap,
-  ShieldCheck,
-  Crown,
-  Coins,
-  Settings2,
-  Target
+  FastForward,
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 
-/**
- * Types
- */
-type CardType = {
-  value: string;
-  suit: string;
-  color: string;
-};
+type CardObj = { value: string; suit: string; color: string };
 
 type GameState = {
-  phase: "lobby" | "betting" | "revealing" | "declaring" | "final" | "results";
+  phase: "lobby" | "betting" | "revealing" | "final" | "results";
   pot: number;
   currentBet: number;
-  revealedCards: CardType[];
-  totalCards: number;
-  handCardsCount: number;
+  revealedCards: CardObj[];
+  totalCards: number; // cards on table
+  handSize?: number; // cards in hand for each player
   adminId: string;
   dealerIndex: number;
   lastAction?: string;
   currentPlayerTurn?: string;
-  gameId?: string; // stable id for the current hand
-  timestamp?: number;
 };
 
 type Player = {
@@ -50,19 +36,14 @@ type Player = {
   isAdmin: boolean;
   isBot: boolean;
   lastBet: number;
-  finalScore?: number;
-  choice?: "min" | "max";
+  finalScore?: number | null;
+  choice?: "min" | "max" | null;
   position: number;
   hasActed: boolean;
-  privateHand?: CardType[] | null;
-  declaredCount?: number | null;
   folded?: boolean;
-  lastAction?: string; // display-only, must not contain card values
+  hand?: CardObj[] | null;
 };
 
-/**
- * Constants & Utilities
- */
 const SUITS = [
   { symbol: "♥", color: "red", name: "hearts" },
   { symbol: "♦", color: "red", name: "diamonds" },
@@ -72,51 +53,25 @@ const SUITS = [
 
 const VALUES = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"];
 
-function hashString(str: string) {
-  let h = 2166136261 >>> 0;
-  for (let i = 0; i < str.length; i++) {
-    h = Math.imul(h ^ str.charCodeAt(i), 16777619) >>> 0;
-    h = (h + (h << 5) + 0x9e3779b9) >>> 0;
+function buildDeck(): CardObj[] {
+  const deck: CardObj[] = [];
+  for (const v of VALUES) {
+    for (const s of SUITS) {
+      deck.push({ value: v, suit: s.symbol, color: s.color });
+    }
   }
-  return Math.abs(h >>> 0);
-}
-function mulberry32(a: number) {
-  return function () {
-    a |= 0;
-    a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
+  return deck;
 }
 
-/**
- * Deterministic deck shuffle.
- * Uses only the provided seedSource so same seed => same deck.
- */
-function generateShuffledDeck(seedSource: string | null) {
-  const deck: { value: string; suit: { symbol: string; color: string } }[] = [];
-  SUITS.forEach((s) => {
-    VALUES.forEach((v) => deck.push({ value: v, suit: s }));
-  });
-  const seedBase = seedSource ? hashString(seedSource) : 0;
-  const rng = mulberry32(seedBase >>> 0);
-  for (let i = deck.length - 1; i > 0; i--) {
-    const j = Math.floor(rng() * (i + 1));
-    const tmp = deck[i];
-    deck[i] = deck[j];
-    deck[j] = tmp;
+function shuffle<T>(arr: T[]): T[] {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
   }
-  return deck.map((d) => ({ value: d.value, suit: d.suit.symbol, color: d.suit.color }));
+  return a;
 }
 
-function generateGameId() {
-  return `g_${Math.random().toString(36).slice(2, 10)}_${Date.now().toString(36)}`;
-}
-
-/**
- * Main component
- */
 export default function Home() {
   const { isConnected, isInitialized } = useFirebaseConnection();
   const { toast } = useToast();
@@ -126,961 +81,745 @@ export default function Home() {
   const [localPlayerId, setLocalPlayerId] = useState<string | null>(localStorage.getItem("poker_player_id"));
   const [isAdminMode, setIsAdminMode] = useState(false);
   const [adminPassword, setAdminPassword] = useState("");
-  const [betAmount, setBetAmount] = useState(0.1);
+  const [betAmount, setBetAmount] = useState(0.10);
   const [finalScoreInput, setFinalScoreInput] = useState("");
-  const [declareCountInput, setDeclareCountInput] = useState<number | "">("");
   const [winHistory, setWinHistory] = useState<any[]>([]);
   const [usernameInput, setUsernameInput] = useState("");
   const [budgetInput, setBudgetInput] = useState("");
   const [tempName, setTempName] = useState("");
 
-  const prevRevealedRef = useRef<number>(0);
-
   const currentUser = localPlayerId ? players[localPlayerId] : null;
 
-  /**
-   * Stable private hand: ONLY depends on localPlayerId and gameState.gameId
-   */
-  const myPrivateHand = useMemo(() => {
-    if (!gameState || !localPlayerId) return [];
-    if (!gameState.gameId) return [];
-    const count = gameState.handCardsCount || 5;
-    const p = players[localPlayerId];
-    if (p?.privateHand && Array.isArray(p.privateHand) && p.privateHand.length >= count) {
-      return p.privateHand.slice(0, count);
-    }
-    const seed = `${localPlayerId}-${gameState.gameId}`;
-    const deck = generateShuffledDeck(seed);
-    return deck.slice(0, count).map((c) => ({ value: c.value, suit: c.suit, color: c.color }));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [gameState?.handCardsCount, gameState?.gameId, localPlayerId, players]);
-
-  /**
-   * Firebase listeners
-   */
   useEffect(() => {
     if (!isConnected) return;
     const stateRef = db.ref("game/state");
     const playersRef = db.ref("game/players");
     const historyRef = db.ref("game/history");
-
-    stateRef.on("value", (snap) => {
-      const data = snap.val();
-      if (data) setGameState(data);
-    });
-
-    playersRef.on("value", (snap) => {
-      const p = snap.val() || {};
+    stateRef.on("value", (snapshot) => setGameState(snapshot.val()));
+    playersRef.on("value", (snapshot) => {
+      const p = snapshot.val() || {};
       setPlayers(p);
-      if (localPlayerId && p[localPlayerId]?.isAdmin) setIsAdminMode(true);
-      else setIsAdminMode(false);
+      if (localPlayerId && p[localPlayerId]?.isAdmin) {
+        setIsAdminMode(true);
+      }
     });
-
-    historyRef.limitToLast(20).on("value", (snap) => {
-      const val = snap.val();
+    historyRef.limitToLast(10).on("value", (snapshot) => {
+      const val = snapshot.val();
       if (val) setWinHistory(Object.values(val).reverse());
       else setWinHistory([]);
     });
-
-    return () => {
-      stateRef.off();
-      playersRef.off();
-      historyRef.off();
-    };
+    return () => { stateRef.off(); playersRef.off(); historyRef.off(); };
   }, [isConnected, localPlayerId]);
 
-  /**
-   * Helper to compute the set of values considered "revealed" for discard purposes.
-   * Rule: if any of 10/J/Q/K is present among revealed, treat the whole group {10,J,Q,K} as revealed.
-   */
-  const computeRevealedValueSet = (revealed: CardType[] | undefined) => {
-    const set = new Set<string>((revealed || []).map((c) => c.value));
-    // If any of the 10-group is present, treat all as present for discard
-    const faceGroup = ["10", "J", "Q", "K"];
-    if (faceGroup.some((v) => set.has(v))) {
-      faceGroup.forEach((v) => set.add(v));
-    }
-    return set;
-  };
+  const getNextActivePlayerId = useCallback(() => {
+    if (!gameState) return null;
+    const playerList = Object.values(players)
+      .filter(p => p && p.folded === false && p.balance > 0)
+      .sort((a, b) => a.position - b.position);
+    if (playerList.length <= 1) return null;
 
-  /**
-   * When revealedCards change -> discard matching-value cards from players' hands (behind the scenes).
-   * No logs or messages should reveal which specific cards were removed from players' hands.
-   */
+    const currentIndex = playerList.findIndex(p => p.id === gameState.currentPlayerTurn);
+    if (currentIndex === -1) return playerList[0].id;
+
+    const nextIndex = (currentIndex + 1) % playerList.length;
+    return playerList[nextIndex].id;
+  }, [gameState, players]);
+
   useEffect(() => {
-    if (!gameState) return;
-    const revealed = gameState.revealedCards || [];
-    const prevLen = prevRevealedRef.current;
-    if (revealed.length !== prevLen) {
-      discardMatchingCardsAgainstTable();
-    }
-    prevRevealedRef.current = revealed.length;
-  }, [gameState?.revealedCards]);
+    if (!gameState || !isConnected || !isAdminMode) return;
+    const playerList = Object.values(players).filter(p => p && p.folded === false).sort((a, b) => a.position - b.position);
+    if (playerList.length === 0) return;
 
-  /**
-   * Join / Admin login
-   */
-  const joinGame = () => {
-    if (!usernameInput.trim() || !budgetInput.trim()) {
-      toast({ title: "Attenzione", description: "Inserisci nome e budget." });
-      return;
+    if (gameState.phase === "betting") {
+      const allActed = playerList.every(p => p.hasActed);
+      const allMatched = playerList.every(p => p.lastBet === gameState.currentBet);
+
+      if (allActed && allMatched) {
+        db.ref("game/state").update({ phase: "revealing" });
+        return;
+      }
+
+      let currentTurnId = gameState.currentPlayerTurn;
+      if (!currentTurnId) {
+        const dealer = playerList[gameState.dealerIndex] || playerList[0];
+        db.ref("game/state").update({ currentPlayerTurn: dealer.id });
+        return;
+      }
+
+      const actingPlayer = players[currentTurnId];
+      if (actingPlayer?.isBot) {
+        const timeout = setTimeout(() => {
+          const targetBet = Math.max(gameState.currentBet, 0.10);
+          const diff = parseFloat((targetBet - actingPlayer.lastBet).toFixed(2));
+          const updates: any = {};
+          updates[`game/players/${actingPlayer.id}/lastBet`] = targetBet;
+          updates[`game/players/${actingPlayer.id}/balance`] = parseFloat((actingPlayer.balance - diff).toFixed(2));
+          updates[`game/players/${actingPlayer.id}/hasActed`] = true;
+
+          const nextPlayerId = getNextActivePlayerId();
+
+          db.ref().update(updates);
+          db.ref("game/state").update({
+            pot: parseFloat((gameState.pot + diff).toFixed(2)),
+            currentBet: targetBet,
+            lastAction: `${actingPlayer.username} punta`,
+            currentPlayerTurn: nextPlayerId
+          });
+        }, 1200);
+        return () => clearTimeout(timeout);
+      }
     }
+
+    if (gameState.phase === "revealing") {
+      const timeout = setTimeout(() => revealNextCard(), 1500);
+      return () => clearTimeout(timeout);
+    }
+
+    if (gameState.phase === "final") {
+      const activePlayers = playerList.filter(p => p.username !== "");
+      const declarations = activePlayers.filter(p => p.choice && p.finalScore !== undefined);
+
+      const botsWithoutChoice = activePlayers.filter(p => p.isBot && !p.choice);
+      if (botsWithoutChoice.length > 0) {
+        const timeout = setTimeout(() => {
+          const updates: any = {};
+          botsWithoutChoice.forEach(bot => {
+            updates[`game/players/${bot.id}/choice`] = Math.random() > 0.5 ? "max" : "min";
+            updates[`game/players/${bot.id}/finalScore`] = Math.floor(Math.random() * 30) + 1;
+          });
+          db.ref().update(updates);
+        }, 1000);
+        return () => clearTimeout(timeout);
+      }
+
+      if (declarations.length === activePlayers.length && activePlayers.length > 0) {
+        const timeout = setTimeout(() => calculateWinners(), 2000);
+        return () => clearTimeout(timeout);
+      }
+    }
+  }, [gameState, players, isConnected, isAdminMode, getNextActivePlayerId]);
+
+  const joinGame = () => {
+    if (!usernameInput.trim() || !budgetInput.trim()) return;
     const uniqueId = db.ref("game/players").push().key!;
     localStorage.setItem("poker_player_id", uniqueId);
     setLocalPlayerId(uniqueId);
     db.ref(`game/players/${uniqueId}`).set({
       id: uniqueId,
-      username: usernameInput.trim().toUpperCase(),
+      username: usernameInput.trim(),
       balance: parseFloat(budgetInput),
       isAdmin: false,
       isBot: false,
       lastBet: 0,
       position: Object.keys(players).length,
       hasActed: false,
-      privateHand: null,
-      declaredCount: null,
       folded: false,
-      lastAction: "",
+      choice: null,
+      finalScore: null,
+      hand: null
     });
   };
 
+  const isDiro = tempName.toLowerCase() === "diro";
+
   const handleAdminLogin = () => {
-    if (adminPassword === "1234" && tempName.toLowerCase() === "diro") {
+    if (adminPassword === "1234" && isDiro) {
       if (!budgetInput) return;
-      const adminId = localPlayerId || db.ref("game/players").push().key!;
+      const adminId = localStorage.getItem("poker_player_id") || db.ref("game/players").push().key!;
       localStorage.setItem("poker_player_id", adminId);
       setLocalPlayerId(adminId);
       setIsAdminMode(true);
       db.ref(`game/players/${adminId}`).set({
         id: adminId,
-        username: "DIRO",
+        username: "diro",
         balance: parseFloat(budgetInput),
         isAdmin: true,
         isBot: false,
         lastBet: 0,
         position: 0,
         hasActed: false,
-        privateHand: null,
-        declaredCount: null,
         folded: false,
-        lastAction: "",
+        choice: null,
+        finalScore: null,
+        hand: null
       });
     } else {
-      toast({ title: "Sistema Protetto", description: "Password errata.", variant: "destructive" });
+      toast({ title: "Errore", description: "Password errata o nome non autorizzato.", variant: "destructive" });
     }
   };
 
-  /**
-   * Admin actions: delete players and history
-   * FIX CRASH: ensure gameId is never undefined. Use empty string so Firebase accepts the value.
-   * Also remove players and history as requested.
-   */
-  const deletePlayersAndHistory = () => {
-    db.ref("game/players").remove();
-    db.ref("game/history").remove();
-    db.ref("game/state").update({
-      phase: "lobby",
-      pot: 0,
-      currentBet: 0,
-      revealedCards: [],
-      totalCards: 5,
-      handCardsCount: 5,
-      adminId: "",
-      dealerIndex: 0,
-      lastAction: "CANCELLA GIOCATORI E CRONOLOGIA",
-      gameId: "", // explicit empty string instead of undefined
-      timestamp: Date.now(),
-    });
-    setPlayers({});
-    setWinHistory([]);
-    toast({ title: "Sistema", description: "Giocatori e cronologia cancellati." });
+  // --- FIX LOGOUT: implement handleLogout to avoid runtime error ---
+  const handleLogout = () => {
+    localStorage.removeItem("poker_player_id");
+    setLocalPlayerId(null);
+    setIsAdminMode(false);
+    // reload to reset in-memory state and listeners
+    window.location.reload();
   };
 
-  /**
-   * Add bot: creates a player with isBot: true. No logs about their cards.
-   */
-  const addBot = (name?: string) => {
-    const r = db.ref("game/players").push();
-    const pos = Object.keys(players).length;
-    const botId = r.key!;
-    r.set({
-      id: botId,
-      username: name || `BOT_${Math.floor(Math.random() * 9000) + 1000}`,
-      balance: 200,
-      isBot: true,
-      isAdmin: false,
-      lastBet: 0,
-      position: pos,
-      hasActed: false,
-      privateHand: null,
-      declaredCount: null,
-      folded: false,
-      lastAction: "",
-    });
-    toast({ title: "Bot aggiunto", description: `${name || "BOT"} creato` });
-  };
+  // Deal hands to all players and save to DB
+  const dealHands = (handSize: number) => {
+    const allPlayers = Object.values(players).filter(p => p && p.username && p.username !== "");
+    if (allPlayers.length === 0) return;
 
-  const setManualDealer = (id: string) => {
-    const p = players[id];
-    if (p) db.ref("game/state").update({ dealerIndex: p.position, currentPlayerTurn: p.id, lastAction: `Dealer impostato su ${p.username}`, timestamp: Date.now() });
-  };
-
-  /**
-   * Assign Las Vegas: assign entire pot to player and reset pot
-   * update player's lastAction generically (no card info).
-   */
-  const assignLasVegas = (playerId: string) => {
-    if (!gameState) return;
-    const pot = gameState.pot || 0;
-    if (pot <= 0) {
-      toast({ title: "Nessun piatto", description: "Il piatto è vuoto." });
-      return;
-    }
-    const p = players[playerId];
-    if (!p) return;
+    const deck = shuffle(buildDeck());
     const updates: any = {};
-    updates[`game/players/${p.id}/balance`] = parseFloat((p.balance + pot).toFixed(2));
-    updates[`game/players/${p.id}/lastAction`] = `LAS VEGAS +${pot.toFixed(2)}€`;
+    let deckIndex = 0;
+
+    allPlayers.forEach((p) => {
+      const hand: CardObj[] = [];
+      for (let i = 0; i < handSize; i++) {
+        if (deckIndex >= deck.length) {
+          deckIndex = 0;
+        }
+        hand.push(deck[deckIndex]);
+        deckIndex++;
+      }
+      updates[`game/players/${p.id}/hand`] = hand;
+    });
+
+    updates["game/state/handSize"] = handSize;
+    updates["game/state/lastAction"] = `Assegnate ${handSize} carte in mano`;
     db.ref().update(updates);
-    db.ref("game/history").push({ winners: `${p.username} (LAS VEGAS)`, pot, timestamp: Date.now() });
-    db.ref("game/state").update({ pot: 0, lastAction: `ASSEGNA LAS VEGAS a ${p.username}`, timestamp: Date.now() });
-    toast({ title: "Assegnato", description: `${pot.toFixed(2)}€ accreditati a ${p.username}` });
   };
 
-  /**
-   * Start game: assign private hands to players and set gameId (stable per hand)
-   * Also resets folded flag and lastAction for all players.
-   */
-  const startGame = (totalCards: number, handCards: number) => {
-    const gameId = generateGameId();
-    const now = Date.now();
+  // Admin sets hand size (5,6,7) in DB and deals hands immediately
+  const setHandSize = (n: number) => {
+    db.ref("game/state").update({ handSize: n, lastAction: `Impostate ${n} carte in mano` });
+    dealHands(n);
+  };
+
+  // startGame sets table cards (totalCards) and resets bets; will also ensure players' hands exist
+  const startGame = (totalCards: number) => {
+    const handSize = gameState?.handSize || 5;
     db.ref("game/state").set({
       phase: "betting",
       pot: 0,
       currentBet: 0,
       revealedCards: [],
       totalCards,
-      handCardsCount: handCards,
+      handSize,
       adminId: localPlayerId || "admin",
       dealerIndex: 0,
-      lastAction: `Nuova Mano: ${handCards} in mano, ${totalCards} a terra`,
-      currentPlayerTurn: "",
-      gameId,
-      timestamp: now,
+      lastAction: `Inizio partita: ${totalCards} carte`,
+      currentPlayerTurn: ""
     });
     const updates: any = {};
-    Object.keys(players).forEach((id) => {
+    Object.keys(players).forEach(id => {
       updates[`game/players/${id}/lastBet`] = 0;
       updates[`game/players/${id}/finalScore`] = null;
       updates[`game/players/${id}/choice`] = null;
       updates[`game/players/${id}/hasActed`] = false;
-      updates[`game/players/${id}/declaredCount`] = null;
-      updates[`game/players/${id}/folded`] = false; // reset folded at new hand
-      updates[`game/players/${id}/lastAction`] = "";
-      const seed = `${id}-${gameId}`; // stable per hand
-      const deck = generateShuffledDeck(seed);
-      updates[`game/players/${id}/privateHand`] = deck.slice(0, handCards);
+      updates[`game/players/${id}/folded`] = false;
     });
     db.ref().update(updates);
+
+    dealHands(handSize);
   };
 
-  // initRound accepts only 4,5,6 (no 3)
-  const initRound = (commonCards: 4 | 5 | 6) => {
-    const handCardsDefault = gameState?.handCardsCount || 5;
-    startGame(commonCards, handCardsDefault);
-  };
-
-  /**
-   * Discard: remove any cards in players' privateHand whose value appears on the table (revealedCards).
-   * This happens behind the scenes: no messages revealing which cards were removed.
-   *
-   * Rule: if any of {10,J,Q,K} is on table, consider the whole group present for discard.
-   */
-  const discardMatchingCardsAgainstTable = () => {
-    if (!gameState) return;
-    const revealed = gameState.revealedCards || [];
-
-    const revealedValues = computeRevealedValueSet(revealed);
-
-    if (revealedValues.size === 0) return;
-
-    const updates: any = {};
-    Object.values(players).forEach((p) => {
-      const hand = p.privateHand || [];
-      const filtered = hand.filter((c) => !revealedValues.has(c.value));
-      if (filtered.length !== hand.length) {
-        updates[`game/players/${p.id}/privateHand`] = filtered;
-        if (p.declaredCount !== undefined && p.declaredCount !== null && p.declaredCount > filtered.length) {
-          updates[`game/players/${p.id}/declaredCount`] = filtered.length;
-        }
-        // Do NOT set any per-player textual message about what was discarded.
-        // Do NOT set game/state lastAction indicating discard details.
-      }
-    });
-
-    if (Object.keys(updates).length > 0) {
-      db.ref().update(updates);
-      // Do not write any "scarto" messages to game/state or players.
-      // We may update a timestamp only if needed; omitted to preserve privacy.
-    }
-  };
-
-  /**
-   * Helper: get next active (non-folded) player id after given playerId
-   */
-  const getNextActivePlayerId = (afterPlayerId: string | null) => {
-    const playerList = Object.values(players).sort((a, b) => a.position - b.position);
-    if (playerList.length === 0) return "";
-    const startIndex = afterPlayerId ? Math.max(0, playerList.findIndex((p) => p.id === afterPlayerId)) : -1;
-    for (let i = 1; i <= playerList.length; i++) {
-      const idx = (startIndex + i) % playerList.length;
-      const candidate = playerList[idx];
-      if (!candidate.folded) return candidate.id;
-    }
-    return ""; // no active players found
-  };
-
-  /**
-   * Reveal next card
-   *
-   * Ensures all revealed card VALUES on the table are unique.
-   * Picks a value not already present on the table; chooses a random suit for it.
-   * No console logs about missing values to avoid revealing internal state.
-   */
   const revealNextCard = () => {
     if (!gameState) return;
-
-    const currentRevealed = gameState.revealedCards || [];
-    const existingValues = new Set(currentRevealed.map((c) => c.value));
-
-    // available values = values not yet on the table
-    const availableValues = VALUES.filter((v) => !existingValues.has(v));
-
-    if (availableValues.length === 0) {
-      // nothing to reveal (shouldn't happen for 4/5/6), silently skip
-      return;
-    }
-
-    // pick a random unique value
-    const value = availableValues[Math.floor(Math.random() * availableValues.length)];
     const suit = SUITS[Math.floor(Math.random() * SUITS.length)];
-    const nextCard: CardType = { value, suit: suit.symbol, color: suit.color };
-    const nextRevealed = [...currentRevealed, nextCard];
+    const value = VALUES[Math.floor(Math.random() * VALUES.length)];
+    const nextCard = { value, suit: suit.symbol, color: suit.color };
+    const nextRevealed = [...(gameState.revealedCards || []), nextCard];
 
-    const playerList = Object.values(players).sort((a, b) => a.position - b.position);
-
-    db.ref("game/state").update({
-      revealedCards: nextRevealed,
-      phase: nextRevealed.length >= gameState.totalCards ? "declaring" : "betting",
-      currentBet: 0,
-      dealerIndex: (gameState.dealerIndex + 1) % Math.max(1, playerList.length),
-      currentPlayerTurn: "",
-      lastAction: `Carta rivelata: ${value}${suit.symbol}`, // display of table card is allowed
-      timestamp: Date.now(),
-    });
-
-    // apply discard immediately (behind the scenes)
-    discardMatchingCardsAgainstTable();
-
-    const updates: any = {};
-    Object.keys(players).forEach((id) => {
-      updates[`game/players/${id}/lastBet`] = 0;
-      updates[`game/players/${id}/hasActed`] = false;
-    });
-    db.ref().update(updates);
-    setBetAmount(0.1);
-  };
-
-  /**
-   * Reset hand admin (keeps players)
-   */
-  const resetHandAdmin = () => {
-    const newGameId = generateGameId();
-    db.ref("game/state").update({
-      pot: 0,
-      revealedCards: [],
-      currentBet: 0,
-      phase: "lobby",
-      gameId: newGameId,
-      lastAction: "RESET MANO (pot e carte azzerati) - nuovo gameId generato",
-      timestamp: Date.now(),
-    });
-    const updates: any = {};
-    Object.keys(players).forEach((id) => {
-      updates[`game/players/${id}/lastBet`] = 0;
-      updates[`game/players/${id}/hasActed`] = false;
-      updates[`game/players/${id}/declaredCount`] = null;
-      updates[`game/players/${id}/privateHand`] = null; // cleared so startGame will reassign based on new gameId
-      updates[`game/players/${id}/folded`] = false; // reset folded
-      updates[`game/players/${id}/finalScore`] = null;
-      updates[`game/players/${id}/choice`] = null;
-      updates[`game/players/${id}/lastAction`] = "";
-    });
-    db.ref().update(updates);
-    toast({ title: "Reset mano", description: "Piatto e carte a terra azzerati. Nuovo gameId creato." });
-  };
-
-  /**
-   * Bets, checks and fold
-   * lastAction set generically (never contains card values)
-   */
-  const handleBet = () => {
-    if (!gameState || !currentUser || gameState.currentPlayerTurn !== localPlayerId) return;
-    if (currentUser.folded) return;
-    const betVal = parseFloat(Math.max(0.1, Math.min(2.0, betAmount)).toFixed(2));
-    const diff = parseFloat((betVal - currentUser.lastBet).toFixed(2));
-    if (diff > currentUser.balance) {
-      toast({ title: "Fiches insufficienti!" });
-      return;
-    }
-    const updates: any = {};
-    if (betVal > gameState.currentBet) {
-      Object.keys(players).forEach((id) => (updates[`game/players/${id}/hasActed`] = id === localPlayerId));
+    if (nextRevealed.length >= gameState.totalCards) {
+      db.ref("game/state").update({ revealedCards: nextRevealed, phase: "final", currentBet: 0, lastAction: "Tutte le carte svelate!", currentPlayerTurn: "" });
     } else {
-      updates[`game/players/${localPlayerId}/hasActed`] = true;
+      db.ref("game/state").update({ revealedCards: nextRevealed, phase: "betting", currentBet: 0, lastAction: "Carta svelata!", currentPlayerTurn: "" });
     }
+
+    const updates: any = {};
+    Object.keys(players).forEach(id => {
+      updates[`game/players/${id}/lastBet`] = 0;
+      updates[`game/players/${id}/hasActed`] = false;
+    });
+    db.ref().update(updates);
+    setBetAmount(0.10);
+  };
+
+  // --- FIX TASTO +BOT: add a single bot at a time ---
+  const handleAddBot = () => {
+    const r = db.ref("game/players").push();
+    const botId = r.key!;
+    const name = `Bot_${Math.floor(Math.random() * 1000)}`;
+    const pos = Object.keys(players).length;
+    r.set({ id: botId, username: name, balance: 100, isAdmin: false, isBot: true, lastBet: 0, position: pos, hasActed: false, folded: false, choice: null, finalScore: null, hand: null });
+  };
+
+  const handleBet = () => {
+    if (!gameState || !currentUser || !localPlayerId) return;
+    if (!isAdminMode && gameState.currentPlayerTurn !== localPlayerId) return;
+
+    const betVal = parseFloat(betAmount.toFixed(2));
+    const diff = parseFloat((betVal - (currentUser.lastBet || 0)).toFixed(2));
+    if (diff > currentUser.balance) return;
+    const updates: any = {};
+    if (betVal > gameState.currentBet) { Object.keys(players).forEach(id => updates[`game/players/${id}/hasActed`] = id === localPlayerId); }
+    else { updates[`game/players/${localPlayerId}/hasActed`] = true; }
     updates[`game/players/${localPlayerId}/balance`] = parseFloat((currentUser.balance - diff).toFixed(2));
     updates[`game/players/${localPlayerId}/lastBet`] = betVal;
-    updates[`game/players/${localPlayerId}/lastAction`] = `Ha puntato €${betVal.toFixed(2)}`;
+
+    const nextPlayerId = getNextActivePlayerId();
 
     db.ref().update(updates);
-    const nextId = getNextActivePlayerId(localPlayerId);
     db.ref("game/state").update({
       pot: parseFloat((gameState.pot + diff).toFixed(2)),
       currentBet: betVal,
-      currentPlayerTurn: nextId,
-      timestamp: Date.now(),
+      lastAction: `${currentUser.username} punta ${betVal}€`,
+      currentPlayerTurn: nextPlayerId || ""
     });
   };
 
   const handleCheck = () => {
-    if (!gameState || !currentUser || gameState.currentPlayerTurn !== localPlayerId) return;
-    if (currentUser.folded) return;
-    db.ref(`game/players/${localPlayerId}`).update({ hasActed: true, lastAction: "Check" });
-    const nextId = getNextActivePlayerId(localPlayerId);
-    db.ref("game/state").update({ currentPlayerTurn: nextId, timestamp: Date.now() });
+    if (!gameState || !currentUser || !localPlayerId) return;
+    if (!isAdminMode && gameState.currentPlayerTurn !== localPlayerId) return;
+
+    if (currentUser.lastBet === gameState.currentBet) {
+      const nextPlayerId = getNextActivePlayerId();
+      db.ref(`game/players/${localPlayerId}`).update({ hasActed: true });
+      db.ref("game/state").update({
+        lastAction: `${currentUser.username} fa Check`,
+        currentPlayerTurn: nextPlayerId || ""
+      });
+    }
   };
 
   const handleFold = () => {
-    if (!gameState || !currentUser || gameState.currentPlayerTurn !== localPlayerId) return;
-    if (currentUser.folded) return;
-    const updates: any = {};
-    updates[`game/players/${localPlayerId}/folded`] = true;
-    updates[`game/players/${localPlayerId}/hasActed`] = true;
-    updates[`game/players/${localPlayerId}/lastAction`] = "Fold";
-    db.ref().update(updates);
-    const nextId = getNextActivePlayerId(localPlayerId);
-    db.ref("game/state").update({ currentPlayerTurn: nextId, timestamp: Date.now(), lastAction: `Player ${currentUser.username} folded` });
+    if (!gameState || !currentUser || !localPlayerId) return;
+    if (!isAdminMode && gameState.currentPlayerTurn !== localPlayerId) return;
+
+    const nextPlayerId = getNextActivePlayerId();
+    db.ref(`game/players/${localPlayerId}`).update({ folded: true, hasActed: true });
+    db.ref("game/state").update({
+      lastAction: `${currentUser.username} Fold`,
+      currentPlayerTurn: nextPlayerId || ""
+    });
   };
 
-  /**
-   * Declaration
-   */
-  const submitDeclaration = (count: number) => {
-    if (!currentUser) return;
-    const c = Math.max(0, Math.min(gameState?.handCardsCount || 5, Math.floor(count)));
-    db.ref(`game/players/${currentUser.id}`).update({ declaredCount: c });
-    setDeclareCountInput("");
-  };
-
-  /**
-   * Scoring: K/Q/J/10 = 10, 2-9 numeric, Ace dynamic.
-   */
-  function cardValueForChoice(val: string, choice: "min" | "max") {
-    if (val === "A") return choice === "min" ? 1 : 11;
-    if (val === "K" || val === "Q" || val === "J" || val === "10") return 10;
-    const num = parseInt(val, 10);
-    return Number.isNaN(num) ? 0 : num;
-  }
-  function computeFinalScoreFromHandArray(hand: CardType[] = [], choice: "min" | "max") {
-    return hand.reduce((acc, c) => acc + cardValueForChoice(c.value, choice), 0);
-  }
   const submitFinal = (choice: "min" | "max") => {
-    if (!currentUser) return;
-    const hand = currentUser.privateHand || myPrivateHand;
-    const score = computeFinalScoreFromHandArray(hand, choice);
-    db.ref(`game/players/${currentUser.id}`).update({ choice, finalScore: score });
+    if (!currentUser || !finalScoreInput) return;
+    db.ref(`game/players/${currentUser.id}`).update({ choice, finalScore: parseInt(finalScoreInput) });
   };
 
-  /**
-   * Calculate winners
-   */
+  const handleNextHand = () => {
+    if (!isAdminMode) return;
+    db.ref("game/state").update({ phase: "lobby", pot: 0, currentBet: 0, revealedCards: [] });
+  };
+
   const calculateWinners = (specialWinnerId?: string) => {
     if (!gameState) return;
-    const updates: any = {};
-    Object.values(players).forEach((p) => {
-      if (p.choice && (p.finalScore === undefined || p.finalScore === null)) {
-        const sc = computeFinalScoreFromHandArray(p.privateHand || [], p.choice);
-        updates[`game/players/${p.id}/finalScore`] = sc;
-      }
-    });
-    if (Object.keys(updates).length > 0) db.ref().update(updates);
+    const playerList = Object.values(players).filter(p => p && p.folded === false && p.choice && p.finalScore !== undefined);
 
-    const playerList = Object.values(players).filter((p) => !p.folded && p.choice && p.finalScore !== undefined);
     const pot = gameState.pot;
-    const winnerUpdates: any = {};
+    const updates: any = {};
     const winnersInfo: string[] = [];
 
     if (specialWinnerId) {
-      const w = players[specialWinnerId];
-      if (w) {
-        winnerUpdates[`game/players/${w.id}/balance`] = parseFloat((players[w.id].balance + pot).toFixed(2));
-        winnersInfo.push(`${w.username} [JACKPOT]`);
+      const winnerObj = players[specialWinnerId];
+      if (winnerObj) {
+        updates[`game/players/${winnerObj.id}/balance`] = parseFloat((players[winnerObj.id].balance + pot).toFixed(2));
+        winnersInfo.push(`${winnerObj.username}: +${pot.toFixed(2)}€ (100%) [LAS VEGAS]`);
       }
     } else {
-      const runCategory = (cat: "min" | "max", potShare: number) => {
-        const eligible = playerList.filter((p) => p.choice === cat);
-        if (eligible.length === 0) return;
-        const bestVal = cat === "min" ? Math.min(...eligible.map((p) => p.finalScore!)) : Math.max(...eligible.map((p) => p.finalScore!));
-        const winners = eligible.filter((p) => p.finalScore === bestVal);
-        winners.forEach((winner) => {
-          const split = parseFloat((potShare / winners.length).toFixed(2));
-          winnerUpdates[`game/players/${winner.id}/balance`] = parseFloat((players[winner.id].balance + split).toFixed(2));
-          winnersInfo.push(`${winner.username} (${cat})`);
+      if (playerList.length === 0) return;
+      const processCategory = (category: "min" | "max", share: number) => {
+        const candidates = playerList.filter(p => p.choice === category);
+        if (candidates.length === 0) return 0;
+
+        const bestScore = category === "min"
+          ? Math.min(...candidates.map(p => p.finalScore!))
+          : Math.max(...candidates.map(p => p.finalScore!));
+
+        const winners = candidates.filter(p => p.finalScore === bestScore);
+        const splitAmount = parseFloat((share / winners.length).toFixed(2));
+        const percentage = Math.round((splitAmount / pot) * 100);
+
+        winners.forEach(w => {
+          updates[`game/players/${w.id}/balance`] = parseFloat((players[w.id].balance + splitAmount).toFixed(2));
+          winnersInfo.push(`${w.username}: +${splitAmount}€ (${percentage}%) [${category.toUpperCase()}${winners.length > 1 ? ' Pareggio' : ''}]`);
         });
+
+        return share;
       };
-      const hasMin = playerList.some((p) => p.choice === "min");
-      const hasMax = playerList.some((p) => p.choice === "max");
-      if (hasMin && hasMax) {
-        runCategory("min", pot / 2);
-        runCategory("max", pot / 2);
-      } else if (hasMin) {
-        runCategory("min", pot);
-      } else if (hasMax) {
-        runCategory("max", pot);
+
+      const minCandidates = playerList.filter(p => p.choice === "min");
+      const maxCandidates = playerList.filter(p => p.choice === "max");
+
+      if (minCandidates.length > 0 && maxCandidates.length > 0) {
+        processCategory("min", pot / 2);
+        processCategory("max", pot / 2);
+      } else if (minCandidates.length > 0) {
+        processCategory("min", pot);
+      } else if (maxCandidates.length > 0) {
+        processCategory("max", pot);
       }
     }
 
-    if (Object.keys(winnerUpdates).length > 0) db.ref().update(winnerUpdates);
-    if (winnersInfo.length > 0) db.ref("game/history").push({ winners: winnersInfo.join(", "), pot, timestamp: Date.now() });
-    db.ref("game/state").update({ phase: "results", timestamp: Date.now() });
+    if (Object.keys(updates).length > 0) {
+      db.ref().update(updates);
+    }
+
+    if (winnersInfo.length > 0) {
+      db.ref("game/history").push({
+        winners: winnersInfo.join(", "),
+        pot: pot,
+        timestamp: Date.now()
+      });
+    }
+
+    db.ref("game/state").update({
+      phase: "results",
+      lastAction: specialWinnerId ? `LAS VEGAS: ${players[specialWinnerId]?.username} vince tutto!` : `Fine mano: ${winnersInfo.length} vincitori`
+    });
   };
 
-  /**
-   * Helpers
-   */
-  const setClampedBet = (val: number) => {
-    const clamped = parseFloat(Math.max(0.1, Math.min(2.0, val)).toFixed(2));
-    setBetAmount(clamped);
+  const resetHand = () => {
+    if (!gameState) return;
+    db.ref("game/state").update({ phase: "betting", pot: 0, currentBet: 0, revealedCards: [], lastAction: "Mano resettata", currentPlayerTurn: "" });
+    const updates: any = {};
+    Object.keys(players).forEach(id => {
+      updates[`game/players/${id}/lastBet`] = 0;
+      updates[`game/players/${id}/finalScore`] = null;
+      updates[`game/players/${id}/choice`] = null;
+      updates[`game/players/${id}/hasActed`] = false;
+      updates[`game/players/${id}/folded`] = false;
+      updates[`game/players/${id}/hand`] = null;
+    });
+    db.ref().update(updates);
   };
 
-  const handleLogout = () => {
-    if (localPlayerId) db.ref(`game/players/${localPlayerId}`).remove();
-    localStorage.removeItem("poker_player_id");
-    setLocalPlayerId(null);
-    setIsAdminMode(false);
+  // delete players (except admin) and clear history and UI state
+  const deletePlayersAndHistory = () => {
+    if (!localPlayerId) return;
+    const playersRef = db.ref("game/players");
+    const historyRef = db.ref("game/history");
+    const stateRef = db.ref("game/state");
+
+    // Remove history from DB and UI
+    historyRef.remove();
+    setWinHistory([]);
+
+    stateRef.update({
+      phase: "lobby",
+      pot: 0,
+      currentBet: 0,
+      revealedCards: [],
+      totalCards: 5,
+      lastAction: "Gioco e cronologia azzerati",
+      history: null
+    });
+
+    playersRef.once("value", (snapshot) => {
+      const allPlayers = snapshot.val() || {};
+      const updates: any = {};
+      let positionIndex = 0;
+      Object.keys(allPlayers).forEach(id => {
+        const player = allPlayers[id];
+        if (id === localPlayerId) {
+          // Reset admin player
+          updates[id] = {
+            ...player,
+            balance: parseFloat(budgetInput) || player.balance,
+            lastBet: 0,
+            hasActed: false,
+            choice: null,
+            finalScore: null,
+            position: positionIndex++,
+            folded: false,
+            hand: null
+          };
+        } else if (player.isBot) {
+          // Reset bot balance to 100€ instead of deleting
+          updates[id] = {
+            ...player,
+            balance: 100,
+            lastBet: 0,
+            hasActed: false,
+            choice: null,
+            finalScore: null,
+            position: positionIndex++,
+            folded: false,
+            hand: null
+          };
+        } else {
+          // Delete non-admin human players
+          updates[id] = null;
+        }
+      });
+      playersRef.update(updates);
+    });
   };
 
-  const returnToLobby = () => db.ref("game/state").update({ phase: "lobby" });
+  const systemWipe = () => { db.ref("game").remove(); localStorage.removeItem("poker_player_id"); setLocalPlayerId(null); setIsAdminMode(false); window.location.reload(); };
+  const setManualDealer = (id: string) => { const p = players[id]; if (p) db.ref("game/state").update({ dealerIndex: p.position, currentPlayerTurn: p.id, lastAction: `Dealer forzato: ${p.username}` }); };
 
-  /**
-   * UI-level: compute revealed set (with face-group) to filter visible hand
-   * - The visual disappearance is applied only to the current player's displayed hand.
-   * - All discard operations on privateHand are performed server-side and silently.
-   */
-  const revealedValueSet = useMemo(() => {
-    const vals = computeRevealedValueSet(gameState?.revealedCards || []);
-    return vals;
-  }, [gameState?.revealedCards]);
+  if (!isInitialized) return <div className="min-h-screen bg-black flex items-center justify-center text-[#D4AF37] font-black italic text-4xl animate-pulse tracking-tighter">LAS VEGAS LIVE...</div>;
 
-  const visibleMyHand = useMemo(() => {
-    const hand = currentUser?.privateHand && Array.isArray(currentUser.privateHand) ? currentUser.privateHand : myPrivateHand;
-    if (!hand || hand.length === 0) return [];
-    return hand.filter((c) => !revealedValueSet.has(c.value));
-  }, [currentUser?.privateHand, myPrivateHand, revealedValueSet]);
-
-  /**
-   * Render (UI unchanged visually).
-   * Under each player's name we display only lastAction (bets/check/fold/lasvegas),
-   * and never any card values. Discard messages removed entirely.
-   */
-  if (!isInitialized) {
-    return (
-      <div className="min-h-screen bg-black flex flex-col items-center justify-center space-y-6">
-        <motion.div initial={{ scale: 0.8 }} animate={{ scale: 1 }} transition={{ repeat: Infinity, duration: 2, repeatType: "reverse" }}>
-          <Trophy className="w-20 h-20 text-[#D4AF37]" />
-        </motion.div>
-        <div className="text-[#D4AF37] font-black italic text-4xl uppercase tracking-tighter">Inizializzazione Tavolo...</div>
-      </div>
-    );
-  }
+  // Helper: filtered current user's hand (Scarto Silenzioso)
+  const filteredLocalHand = (() => {
+    if (!currentUser?.hand || !gameState) return currentUser?.hand || [];
+    const tableValues = new Set((gameState.revealedCards || []).map(c => c.value));
+    // Scarto Silenzioso: hide cards that have same value as any revealed card
+    return currentUser.hand.filter(c => !tableValues.has(c.value));
+  })();
 
   return (
-    <div className="min-h-screen bg-zinc-950 text-white p-4 font-sans selection:bg-[#D4AF37] overflow-x-hidden relative">
-      {/* background */}
-      <div className="fixed inset-0 pointer-events-none z-0">
-        <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] bg-[#004225] rounded-full blur-[150px] opacity-20" />
-        <div className="absolute bottom-[-10%] right-[-10%] w-[40%] h-[40%] bg-[#D4AF37] rounded-full blur-[150px] opacity-10" />
-      </div>
+    <div className="min-h-screen bg-black text-white p-4 font-sans selection:bg-[#D4AF37] overflow-x-hidden">
+      <div className="fixed inset-0 pointer-events-none opacity-20"><div className="w-[80vw] h-[80vh] bg-[#004225] rounded-[200px] blur-[120px] mx-auto mt-[10vh]" /></div>
 
-      {/* header */}
-      <header className="max-w-7xl mx-auto flex justify-between items-center mb-10 relative z-10 border-b border-white/5 pb-6">
-        <div className="flex items-center gap-5">
-          <div className="w-14 h-14 bg-gradient-to-br from-[#D4AF37] to-[#996515] rounded-2xl flex items-center justify-center shadow-xl rotate-3">
-            <Trophy className="text-black w-8 h-8" />
-          </div>
-          <div>
-            <h1 className="text-4xl md:text-5xl font-black text-white italic uppercase tracking-tighter flex items-center gap-2">
-              LAS VEGAS <span className="text-[#D4AF37]">LIVE</span>
-            </h1>
-            <div className="flex items-center gap-2 text-[10px] text-white/40 font-bold uppercase tracking-[0.3em]">
-              <ShieldCheck className="w-3 h-3 text-[#50C878]" /> Server Sicuro: Criptato
-            </div>
-          </div>
-        </div>
-
-        <div className="flex items-center gap-4">
-          <div className="hidden md:flex flex-col items-end">
-            <span className="text-[10px] text-white/20 font-black uppercase">Stato Connessione</span>
-            <span className="text-[#50C878] text-xs font-black uppercase flex items-center gap-1">
-              <span className="w-2 h-2 bg-[#50C878] rounded-full animate-pulse" /> Online
-            </span>
-          </div>
-          {currentUser && (
-            <Button variant="outline" onClick={() => { if (localPlayerId) db.ref(`game/players/${localPlayerId}`).remove(); handleLogout(); }} className="border-red-900/30 text-red-500 hover:bg-red-50/5">
-              ESCI
-            </Button>
-          )}
-        </div>
-      </header>
-
-      <main className="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-12 gap-8 relative z-10">
-        {/* left column */}
-        <div className="lg:col-span-3 space-y-6">
-          {/* login */}
-          {!currentUser && (
-            <Card className="bg-zinc-900/80 border-[#D4AF37]/20 border-2 backdrop-blur-xl shadow-2xl overflow-hidden rounded-[30px]">
-              <div className="p-8 space-y-5">
-                <div className="text-center space-y-1">
-                  <h2 className="text-2xl font-black italic uppercase text-white">BENVENUTO</h2>
-                  <p className="text-[10px] text-white/40 uppercase font-bold tracking-widest">Inserisci i tuoi dati</p>
-                </div>
-                <Input placeholder="IL TUO NICKNAME" className="h-14 bg-black/40 border-white/5 text-center font-black italic text-xl rounded-2xl" value={tempName} onChange={e => setTempName((e.target as HTMLInputElement).value)} />
-                <Input type="password" placeholder="PASSWORD" className="h-14 bg-black/40 border-white/5 text-center text-xl rounded-2xl" value={adminPassword} onChange={e => setAdminPassword((e.target as HTMLInputElement).value)} />
-                <Input type="number" placeholder="BUDGET €" className="h-14 bg-black/40 border-white/5 text-center text-xl font-black rounded-2xl" value={budgetInput} onChange={e => setBudgetInput((e.target as HTMLInputElement).value)} />
-                <Button onClick={tempName.toLowerCase() === 'diro' ? handleAdminLogin : joinGame} className={`w-full h-16 ${tempName.toLowerCase() === 'diro' ? 'bg-[#D4AF37]' : 'bg-[#50C878]'} text-black font-black uppercase rounded-2xl`}>
-                  {tempName.toLowerCase() === 'diro' ? 'ACCEDI COME BOSS' : 'GIOCA ORA'}
-                </Button>
-              </div>
-            </Card>
-          )}
-
-          {/* admin panel */}
-          {isAdminMode && (
-            <Card className="bg-black/90 border-[#D4AF37] border-2 shadow-[0_0_50px_rgba(212,175,55,0.1)] p-5 rounded-[30px] overflow-hidden">
-              <div className="flex flex-col gap-4">
-                <div className="flex items-center gap-2 mb-2 border-b border-[#D4AF37]/20 pb-2">
-                  <Settings2 className="w-5 h-5 text-[#D4AF37]" />
-                  <span className="font-black text-xs uppercase italic text-[#D4AF37]">Pannello di Controllo Boss</span>
-                </div>
-
-                <div>
-                  <label className="text-[9px] text-white/30 font-black uppercase ml-1">Configurazione Round</label>
-                  <div className="grid grid-cols-3 gap-2 mt-2">
-                    {[5,6,7].map(n => (
-                      <Button key={n} onClick={() => startGame(gameState?.totalCards || 5, n)} className={`h-10 text-[10px] font-black rounded-lg ${gameState?.handCardsCount === n ? 'bg-[#D4AF37] text-black' : 'bg-black/40 text-white'} w-full`}>
-                        {n} CARTE
-                      </Button>
-                    ))}
-                  </div>
-
-                  <div className="grid grid-cols-3 gap-2 mt-2">
-                    {[4,5,6].map(n => (
-                      <Button key={n} onClick={() => startGame(n, gameState?.handCardsCount || 5)} className={`h-10 text-[10px] font-black rounded-lg ${gameState?.totalCards === n ? 'bg-[#D4AF37] text-black' : 'bg-black/40 text-white'} w-full`}>
-                        {n} A TERRA
-                      </Button>
-                    ))}
-                  </div>
-                </div>
-
-                <div className="flex flex-col gap-2">
-                  <Button onClick={revealNextCard} disabled={gameState?.phase !== 'betting'} className="w-full h-12 bg-gradient-to-r from-[#D4AF37] to-[#996515] text-black font-black text-sm uppercase">PROSSIMA CARTA</Button>
-                  <Button onClick={() => addBot()} className="w-full h-12 bg-[#50C878] text-black font-black text-sm uppercase">AGGIUNGI BOT</Button>
-                  <Button onClick={resetHandAdmin} className="w-full h-12 bg-[#D4AF37] text-black font-black uppercase">RESET MANO</Button>
-                  <Button onClick={deletePlayersAndHistory} variant="destructive" className="w-full h-12 text-white font-black uppercase">CANCELLA TUTTI</Button>
-                </div>
-
-                <div>
-                  <p className="text-[8px] text-white/20 text-center uppercase font-black mb-2">Assegna Dealer</p>
-                  <div className="flex flex-wrap gap-1 justify-center">
-                    {Object.values(players).map(p => (
-                      <Button key={p.id} onClick={() => setManualDealer(p.id)} variant="ghost" className="h-6 px-3 text-[9px] font-bold border border-white/5 rounded-full">
-                        {p.username}
-                      </Button>
-                    ))}
-                  </div>
-                </div>
-              </div>
-            </Card>
-          )}
-
-          {/* wallet / pot / history */}
-          <div className="bg-gradient-to-br from-zinc-800 to-black p-6 rounded-[35px] border border-white/10 shadow-2xl relative overflow-hidden group">
-            <div className="absolute -right-4 -top-4 w-24 h-24 bg-[#D4AF37] rounded-full blur-[60px] opacity-10 group-hover:opacity-20 transition-opacity" />
-            <div className="relative z-10 flex flex-col items-center">
-              <span className="text-[10px] font-black uppercase text-[#D4AF37] tracking-[0.4em] mb-2">Il Tuo Saldo</span>
-              <div className="flex items-baseline gap-1">
-                <span className="text-5xl font-black italic text-white tabular-nums">{currentUser?.balance?.toFixed(2) || "0.00"}</span>
-                <span className="text-2xl font-black text-[#D4AF37]">€</span>
-              </div>
-              <div className="mt-4 flex gap-2">
-                <Badge className="bg-[#50C878]/10 text-[#50C878] border-[#50C878]/20 font-black text-[9px]">ATTIVO</Badge>
-                <Badge className="bg-white/5 text-white/40 border-white/10 font-black text-[9px]">ID: {localPlayerId?.slice(0,5)}</Badge>
-              </div>
-            </div>
-          </div>
-
-          <div className="bg-[#004225] p-8 rounded-[40px] border-b-8 border-black/40 shadow-inner flex flex-col items-center relative overflow-hidden">
-            <div className="absolute inset-0 bg-[url('https://www.transparenttextures.com/patterns/felt.png')] opacity-20" />
-            <Coins className="w-8 h-8 text-[#D4AF37]/30 mb-2" />
-            <span className="text-[#D4AF37] text-[10px] font-black uppercase tracking-[0.5em] mb-1">PIATTO ATTUALE</span>
-            <span className="text-5xl font-black italic text-white drop-shadow-[0_4px_10px_rgba(0,0,0,0.5)]">{gameState?.pot?.toFixed(2) || "0.00"}€</span>
-          </div>
-
-          <Card className="bg-black/40 border-white/5 border rounded-[30px] overflow-hidden">
-            <div className="p-5 border-b border-white/5 flex items-center gap-2">
-              <History className="w-4 h-4 text-[#D4AF37]" />
-              <span className="text-xs font-black uppercase tracking-widest text-white/80">Ultime Mani</span>
-            </div>
-            <div className="max-h-[250px] overflow-y-auto custom-scrollbar">
-              {winHistory.length > 0 ? winHistory.map((h, i) => (
-                <div key={i} className="p-4 border-b border-white/5 flex justify-between items-center bg-white/[0.02] hover:bg-white/[0.05] transition-colors">
-                  <div className="flex flex-col">
-                    <span className="text-[11px] font-black uppercase text-white leading-tight">{h.winners}</span>
-                    <span className="text-[8px] text-white/20 font-bold">{new Date(h.timestamp).toLocaleTimeString()}</span>
-                  </div>
-                  <span className="text-[#D4AF37] font-black italic text-lg tabular-nums">+{h.pot.toFixed(2)}€</span>
-                </div>
-              )) : (
-                <div className="p-10 text-center text-white/10 text-[9px] font-black uppercase italic tracking-widest">Nessuna vincita ancora</div>
-              )}
-            </div>
-          </Card>
-        </div>
-
-        {/* center column: table */}
-        <div className="lg:col-span-9 space-y-8">
-          <div className="bg-[#014d2e] border-[15px] border-[#251a12] rounded-[100px] p-12 min-h-[500px] flex items-center justify-center relative shadow-[0_30px_100px_rgba(0,0,0,0.9),inset_0_0_150px_rgba(0,0,0,0.6)]">
-            <div className="absolute inset-0 bg-[url('https://www.transparenttextures.com/patterns/felt.png')] opacity-20 pointer-events-none" />
-            <div className="absolute inset-8 border-2 border-white/10 rounded-[85px] pointer-events-none" />
-
-            {/* common cards center - white background */}
-            <div className="flex flex-wrap gap-6 justify-center items-center relative z-20 mb-28">
-              {Array.from({ length: gameState?.totalCards || 5 }).map((_, idx) => {
-                const card = gameState?.revealedCards?.[idx];
-                const isRevealed = !!card;
-                return (
-                  <div key={idx} className="w-24 h-36 md:w-32 md:h-44 relative perspective-1000">
-                    <motion.div animate={{ rotateY: isRevealed ? 0 : 180 }} transition={{ duration: 0.8, type: "spring" }} style={{ transformStyle: "preserve-3d" }} className="w-full h-full relative">
-                      {/* FRONT: white rectangle with clear text */}
-                      <div className="absolute inset-0 bg-white rounded-2xl border-4 border-[#D4AF37] flex flex-col items-center justify-between py-4 px-2 backface-hidden shadow-2xl">
-                        <div className={`w-full text-lg font-black italic ${card?.color === 'red' ? 'text-red-600' : 'text-black'}`}>{card?.value}{card?.suit}</div>
-                        <div className={`text-6xl font-black ${card?.color === 'red' ? 'text-red-600' : 'text-black'}`}>{card?.suit}</div>
-                        <div className={`w-full text-lg font-black italic rotate-180 ${card?.color === 'red' ? 'text-red-600' : 'text-black'}`}>{card?.value}{card?.suit}</div>
-                      </div>
-                      {/* BACK */}
-                      <div style={{ transform: "rotateY(180deg)" }} className="absolute inset-0 bg-zinc-900 border-4 border-[#D4AF37]/50 rounded-2xl flex items-center justify-center backface-hidden shadow-inner">
-                        <div className="absolute inset-0 bg-[radial-gradient(circle,#D4AF37_1px,transparent_1px)] bg-[size:15px_15px] opacity-10" />
-                        <Target className="w-12 h-12 text-[#D4AF37]/20" />
-                      </div>
-                    </motion.div>
-                  </div>
-                );
-              })}
-            </div>
-
-            {/* player's private cards: white rectangles with black/red text; stable per gameId
-                Filtered in real-time: cards whose value is present on table are not rendered (they "disappear" from UI)
-            */}
-            {visibleMyHand.length > 0 && (
-              <div className="absolute left-1/2 -translate-x-1/2 bottom-6 z-30 pointer-events-none">
-                <div className="flex items-end -space-x-3">
-                  {visibleMyHand.map((card, i) => (
-                    <motion.div
-                      key={i}
-                      initial={{ opacity: 0, y: 20, scale: 0.95 }}
-                      animate={{ opacity: 1, y: 0, scale: 1 }}
-                      transition={{ delay: i * 0.06 }}
-                      className="w-12 h-18 md:w-14 md:h-20 bg-white rounded-md flex flex-col items-center justify-between py-1 px-1 shadow-2xl border border-zinc-300 relative"
-                      style={{ zIndex: 40 + i }}
-                    >
-                      <span className={`text-[9px] font-black leading-none ${card.color === 'red' ? 'text-red-600' : 'text-black'}`}>{card.value}</span>
-                      <span className={`text-base leading-none ${card.color === 'red' ? 'text-red-600' : 'text-black'}`}>{card.suit}</span>
-                      <span className={`text-[9px] font-black leading-none rotate-180 ${card.color === 'red' ? 'text-red-600' : 'text-black'}`}>{card.value}</span>
-                    </motion.div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {/* phase indicator */}
-            <div className="absolute bottom-24 left-1/2 -translate-x-1/2 bg-black/60 backdrop-blur-md px-8 py-2 rounded-full border border-white/10 z-20">
-              <span className="text-[10px] font-black uppercase text-[#D4AF37] tracking-[0.5em] italic">Fase: {gameState?.phase || 'Lobby'}</span>
-            </div>
-          </div>
-
-          {/* actions area - responsive flex-wrap layout */}
-          <AnimatePresence mode="wait">
-            {gameState?.phase === "betting" && currentUser && gameState.currentPlayerTurn === localPlayerId && !currentUser.folded && (
-              <motion.div initial={{ opacity: 0, y: 50 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, scale: 0.9 }} className="bg-zinc-900 border-2 border-[#D4AF37] rounded-[24px] p-4 shadow-2xl relative">
-                <div className="absolute top-0 right-0 p-3"><Zap className="w-8 h-8 text-[#D4AF37] opacity-10 animate-pulse" /></div>
-
-                <div className="flex flex-wrap gap-2 justify-center items-center">
-                  <div className="flex-1 min-w-[220px]">
-                    <div className="flex flex-col">
-                      <span className="text-[11px] font-black uppercase text-[#D4AF37] tracking-[0.4em]">Stai Puntando</span>
-                      <span className="text-3xl md:text-6xl font-black italic text-white tabular-nums">{betAmount.toFixed(2)}€</span>
-                      <span className="text-[11px] font-black uppercase text-white/30 block mt-1">Budget dopo puntata</span>
-                      <span className="text-lg md:text-2xl font-black italic text-[#50C878]">{(currentUser.balance - (betAmount - currentUser.lastBet)).toFixed(2)}€</span>
-                    </div>
-                    <div className="mt-3">
-                      <Slider value={[betAmount]} onValueChange={v => setClampedBet(v[0])} min={0.10} max={2.00} step={0.10} className="py-2" />
-                    </div>
-                  </div>
-
-                  <div className="flex flex-wrap gap-2 justify-center flex-1">
-                    <Button onClick={handleCheck} disabled={currentUser.lastBet !== gameState.currentBet} className="min-w-[80px] text-xs h-10 px-3 flex items-center justify-center">CHECK</Button>
-                    <Button onClick={handleFold} className="min-w-[80px] text-xs h-10 px-3 flex items-center justify-center bg-red-600 text-black">FOLD</Button>
-                    <Button onClick={handleBet} className="min-w-[80px] text-xs md:text-sm h-10 px-3 flex items-center justify-center bg-[#50C878] text-black font-black">PUNTA</Button>
-                  </div>
-                </div>
-              </motion.div>
-            )}
-
-            {gameState?.phase === "declaring" && currentUser && (currentUser.declaredCount === undefined || currentUser.declaredCount === null) && !currentUser.folded && (
-              <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="bg-zinc-900 border-2 border-[#D4AF37] rounded-[40px] p-6 shadow-2xl text-center">
-                <h3 className="text-2xl font-black text-white uppercase mb-2">DICHIARA LE CARTE</h3>
-                <p className="text-sm text-white/40 mb-4">Inserisci quante carte hai (dopo gli scarti automatici)</p>
-                <div className="flex flex-wrap gap-3 items-center justify-center">
-                  <Input type="number" min={0} max={gameState?.handCardsCount || 5} value={declareCountInput as any} onChange={e => setDeclareCountInput(e.target.value === "" ? "" : Math.max(0, Math.min(gameState?.handCardsCount || 5, Number(e.target.value))))} />
-                  <Button onClick={() => typeof declareCountInput === "number" && submitDeclaration(declareCountInput)} className="h-12 bg-[#D4AF37] text-black font-black px-4 rounded-lg">DICHIARA</Button>
-                </div>
-              </motion.div>
-            )}
-
-            {gameState?.phase === "final" && currentUser && !currentUser.choice && !currentUser.folded && (
-              <motion.div initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} className="bg-zinc-900 border-4 border-zinc-800 rounded-[40px] p-6 text-center space-y-6 mx-auto w-full max-w-3xl">
-                <div className="space-y-2">
-                  <h2 className="text-4xl md:text-6xl font-black italic uppercase tracking-tighter text-white">SCEGLI MIN O MAX</h2>
-                  <p className="text-xs text-white/40 font-black uppercase tracking-[0.5em]">L'Asso vale 1 per MIN e 11 per MAX</p>
-                </div>
-                <div className="grid grid-cols-2 md:grid-cols-2 gap-3">
-                  <Button onClick={() => submitFinal("min")} className="h-12 md:h-20 bg-zinc-800 text-white font-black text-lg rounded-[12px]">MIN</Button>
-                  <Button onClick={() => submitFinal("max")} className="h-12 md:h-20 bg-zinc-800 text-white font-black text-lg rounded-[12px]">MAX</Button>
-                </div>
-              </motion.div>
-            )}
-          </AnimatePresence>
-
-          {/* players list - show only lastAction under name (no discard messages, no card info) */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-6 w-full pb-20">
-            {Object.values(players).sort((a, b) => a.position - b.position).map((p) => {
-              const isMe = p.id === localPlayerId;
-              const actionLabel = p.lastAction
-                ? p.lastAction
-                : p.lastBet > 0
-                ? `Ha puntato €${p.lastBet.toFixed(2)}`
-                : p.folded
-                ? "Stato: Folded"
-                : "In attesa";
-
-              return (
-                <motion.div key={p.id} layout className={`p-6 rounded-[40px] border-2 relative transition-all duration-500 ${isMe ? 'border-[#D4AF37] bg-[#D4AF37]/5' : 'border-white/5 bg-black/20'}`}>
-                  {/* dealer indicator */}
-                  {gameState?.dealerIndex === p.position && (
-                    <div className="absolute -top-3 -left-3 w-14 h-14 bg-gradient-to-br from-[#D4AF37] to-[#996515] rounded-2xl flex items-center justify-center text-black font-black text-2xl shadow-xl">D</div>
-                  )}
-
-                  <div className="flex flex-col items-center text-center space-y-3">
-                    <div className="flex flex-col items-center gap-1">
-                      <div className="flex items-center gap-2">
-                        {p.isAdmin && <Crown className="w-4 h-4 text-[#D4AF37]" />}
-                        <span className="text-xs font-black uppercase text-white/50 tracking-widest">{p.username}</span>
-                      </div>
-
-                      <div className="text-3xl font-black italic tabular-nums text-white">{p.balance.toFixed(2)}€</div>
-
-                      <div className="text-[10px] text-white/40">{actionLabel}</div>
-
-                      {p.hasActed === false && !p.folded && (
-                        <Badge className="bg-[#50C878]/10 text-[#50C878] border-[#50C878]/20 font-black text-[9px] uppercase">PRONTO</Badge>
-                      )}
-
-                      {p.folded && (
-                        <Badge className="bg-red-700/10 text-red-300 border-red-700/20 font-black text-[9px] uppercase">FOLDED</Badge>
-                      )}
-                    </div>
-
-                    <div className="w-full flex justify-center mt-3">
-                      <Button onClick={() => assignLasVegas(p.id)} disabled={!isAdminMode} className="h-9 w-full max-w-[160px] text-[11px] px-3 font-black uppercase">
-                        LAS VEGAS
-                      </Button>
-                    </div>
-                  </div>
-                </motion.div>
-              );
-            })}
-          </div>
-        </div>
-      </main>
-
-      {/* results overlay */}
       <AnimatePresence>
         {gameState?.phase === "results" && (
-          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="fixed inset-0 z-[100] flex items-center justify-center bg-black/95 backdrop-blur-2xl p-4">
-            <motion.div initial={{ scale: 0.8, y: 50 }} animate={{ scale: 1, y: 0 }} className="bg-zinc-950 border-2 border-[#D4AF37] rounded-[60px] w-full max-w-2xl overflow-hidden shadow-[0_0_100px_rgba(0,0,0,0.8)]">
-              <div className="bg-gradient-to-b from-[#D4AF37]/20 to-transparent p-12 text-center border-b border-[#D4AF37]/20">
-                <Trophy className="w-20 h-20 text-[#D4AF37] mx-auto mb-4" />
-                <h2 className="text-6xl font-black italic text-[#D4AF37] uppercase tracking-tighter">RISULTATI MANO</h2>
-              </div>
-              <div className="p-10 space-y-4 max-h-[45vh] overflow-y-auto custom-scrollbar">
-                {Object.values(players).sort((a, b) => (b.finalScore || 0) - (a.finalScore || 0)).map((p, idx) => (
-                  <div key={p.id} className="flex justify-between items-center p-6 rounded-[30px] bg-white/[0.03] border border-white/5">
-                    <div className="flex items-center gap-4">
-                      <span className="text-2xl font-black text-white/20 italic">#{idx+1}</span>
-                      <div className="flex flex-col">
-                        <span className="font-black italic uppercase text-xl text-white">{p.username}</span>
-                        <span className={`text-xs font-bold uppercase tracking-widest ${p.choice === 'min' ? 'text-blue-400' : 'text-red-400'}`}>{p.choice || 'NO CHOICE'}</span>
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+            <motion.div initial={{ scale: 0.9, y: 20 }} animate={{ scale: 1, y: 0 }} exit={{ scale: 0.9, y: 20 }} className="bg-black border-2 border-[#D4AF37] rounded-3xl w-full max-w-md overflow-hidden shadow-[0_0_50px_rgba(212,175,55,0.3)]">
+              <div className="bg-[#D4AF37]/10 p-6 border-b border-[#D4AF37]/30 text-center"><h2 className="text-3xl font-black italic text-[#D4AF37] uppercase tracking-tighter">Resoconto Mano</h2></div>
+              <div className="p-6 space-y-4 max-h-[60vh] overflow-y-auto">
+                {(() => {
+                  const playerList = Object.values(players).filter(p => p && p.folded === false && p.choice && p.finalScore !== undefined);
+                  const mins = [...playerList].sort((a,b) => (a.finalScore! - b.finalScore!));
+                  const maxs = [...playerList].sort((a,b) => (b.finalScore! - a.finalScore!));
+                  const minScore = mins[0]?.finalScore;
+                  const maxScore = maxs[0]?.finalScore;
+                  return Object.values(players).sort((a,b) => a.position - b.position).map(p => {
+                    const isMinWinner = p.choice === "min" && p.finalScore === minScore;
+                    const isMaxWinner = p.choice === "max" && p.finalScore === maxScore;
+                    let winAmount = 0;
+                    if (isMinWinner || isMaxWinner) {
+                      const pot = gameState?.pot || 0;
+                      const share = (minScore !== undefined && maxScore !== undefined) ? pot / 2 : pot;
+                      const winnersInCategory = playerList.filter(pl => pl.choice === p.choice && pl.finalScore === p.finalScore).length;
+                      winAmount = parseFloat((share / winnersInCategory).toFixed(2));
+                    }
+                    return (
+                      <div key={p.id} className="flex justify-between items-center p-3 rounded-xl bg-white/5 border border-white/10">
+                        <div className="flex flex-col"><span className="font-black italic uppercase text-sm">{p.username} {p.folded ? '(FOLD)' : ''}</span><span className="text-[10px] text-white/50 uppercase font-bold">{p.choice || 'Nessuna scelta'}</span></div>
+                        <div className="text-right"><span className="text-xl font-black italic text-white block leading-none">{p.finalScore ?? '-'}</span>{(isMinWinner || isMaxWinner) && <span className="text-[#50C878] text-[10px] font-black italic">+{winAmount.toFixed(2)}€</span>}</div>
                       </div>
-                    </div>
-                    <div className="text-4xl font-black italic text-[#D4AF37]">{p.finalScore ?? '—'}</div>
-                  </div>
-                ))}
+                    );
+                  });
+                })()}
               </div>
-              <div className="p-10 bg-black/50">
-                {isAdminMode ? (
-                  <Button onClick={returnToLobby} className="w-full h-20 bg-[#D4AF37] text-black font-black uppercase text-2xl italic shadow-2xl hover:brightness-110 active:scale-95 transition-all rounded-2xl">
-                    AVVIA NUOVA MANO
-                  </Button>
-                ) : (
-                  <div className="flex items-center justify-center gap-4 text-[#D4AF37] font-black italic text-xl animate-pulse">
-                    <Zap className="w-6 h-6" /> IN ATTESA DEL BOSS DIRO...
-                  </div>
-                )}
+              <div className="p-6 bg-[#D4AF37]/5 border-t border-[#D4AF37]/30">
+                {isAdminMode ? <Button onClick={handleNextHand} className="w-full h-14 bg-[#D4AF37] text-black font-black uppercase text-xl italic shadow-[0_6px_0_#996515] active:translate-y-1 active:shadow-none transition-all">Avanti</Button> : <p className="text-center text-[#D4AF37] font-black italic uppercase text-xs animate-pulse">In attesa dell'Admin...</p>}
               </div>
             </motion.div>
           </motion.div>
         )}
       </AnimatePresence>
 
-      {/* footer */}
-      <footer className="max-w-7xl mx-auto py-20 border-t border-white/5 text-center relative z-10">
-        <div className="flex flex-col items-center gap-4 opacity-30">
-          <Trophy className="w-6 h-6" />
-          <p className="text-[10px] font-black uppercase tracking-[1em]">Las Vegas Live Private System v4.0.2</p>
-          <p className="text-[9px] font-bold">Antonio & Diro Partnership © 2026</p>
-        </div>
-      </footer>
+      <header className="max-w-7xl mx-auto flex justify-between items-center mb-6 relative z-10">
+        <div className="flex items-center gap-3"><Trophy className="text-[#D4AF37] w-6 h-6 md:w-8 md:h-8" /><h1 className="text-2xl md:text-3xl font-black text-[#D4AF37] italic uppercase tracking-tighter">Las Vegas Live</h1></div>
+        {currentUser && <Button variant="ghost" onClick={handleLogout} className="text-white/40 font-black h-8 hover:text-white transition-colors text-xs md:text-sm">ESCI</Button>}
+      </header>
 
-      {/* styles */}
-      <style>{`
-        .perspective-1000 { perspective: 1000px; }
-        .backface-hidden { backface-visibility: hidden; }
-        .custom-scrollbar::-webkit-scrollbar { width: 4px; }
-        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
-        .custom-scrollbar::-webkit-scrollbar-thumb { background: #D4AF37; border-radius: 10px; }
-        input[type=number]::-webkit-inner-spin-button, input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
-      `}</style>
+      <main className="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-12 gap-6 relative z-10 pb-20 px-2 sm:px-4 md:max-w-4xl lg:max-w-7xl">
+        <div className="lg:col-span-3 space-y-4 w-full md:scale-90 origin-top-left transition-transform">
+          {!currentUser && (
+            <Card className="bg-black/95 border-[#D4AF37]/30 border-2 shadow-[0_0_20px_rgba(212,175,55,0.1)]">
+              <CardContent className="space-y-4 pt-4 md:pt-6">
+                <Input placeholder="NOME" className="h-10 md:h-12 bg-black/50 border-[#D4AF37]/30 text-center text-base md:text-sm font-black italic" value={tempName} onChange={e => {setTempName(e.target.value); setUsernameInput(e.target.value);}} />
+                <Input type="password" placeholder="Password Admin" className="h-10 md:h-12 bg-black/50 border-[#D4AF37]/30 text-center text-base md:text-sm font-black italic" value={adminPassword} onChange={e => setAdminPassword(e.target.value)} />
+                <Input type="number" placeholder="Budget Gioco" className="h-10 md:h-12 bg-black/50 border-[#D4AF37]/30 text-center text-base md:text-sm font-black italic" value={budgetInput} onChange={e => setBudgetInput(e.target.value)} />
+                {tempName.toLowerCase() === 'diro' ? <Button onClick={handleAdminLogin} className="w-full h-12 bg-[#D4AF37] text-black font-black uppercase text-xl italic shadow-[0_6px_0_#996515]">LOGIN BOSS</Button> : <Button onClick={joinGame} className="w-full h-12 bg-[#50C878] text-black font-black uppercase text-xl italic shadow-[0_6px_0_#004225]">GIOCA</Button>}
+              </CardContent>
+            </Card>
+          )}
+
+          {currentUser && (
+            <div className="space-y-4">
+              {isAdminMode && (
+                <Card className="bg-black/95 border-[#D4AF37] border-2 shadow-2xl">
+                  <CardContent className="p-3 space-y-3">
+                    <div className="text-[9px] text-white/60 uppercase font-black mb-1">Carte in mano (per giocatore)</div>
+                    <div className="grid grid-cols-3 gap-1 mb-2">
+                      {[5,6,7].map(n => (
+                        <Button
+                          key={n}
+                          onClick={() => setHandSize(n)}
+                          variant="outline"
+                          className={`h-7 text-[#50C878] text-[8px] font-black ${gameState?.handSize === n ? 'bg-[#50C878]/20' : ''}`}
+                        >
+                          {n} IN MANO
+                        </Button>
+                      ))}
+                    </div>
+
+                    <div className="text-[9px] text-white/60 uppercase font-black mb-1">Carte a terra</div>
+                    <div className="grid grid-cols-3 gap-1">
+                      {[4,5,6].map(n => (
+                        <Button
+                          key={n}
+                          onClick={() => startGame(n)}
+                          variant="outline"
+                          className={`h-7 text-[#50C878] text-[8px] font-black ${gameState?.totalCards === n ? 'bg-[#50C878]/20' : ''}`}
+                        >
+                          {n} CARTE
+                        </Button>
+                      ))}
+                    </div>
+
+                    <div className="mt-3">
+                      <Button onClick={revealNextCard} disabled={gameState?.phase !== 'betting'} className="w-full h-10 bg-[#D4AF37] text-black font-black text-[9px] shadow-[0_4px_0_#996515]"><FastForward className="w-3 h-3 mr-1" /> GIRA (FORZA)</Button>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2 mt-3">
+                      <Button onClick={handleAddBot} variant="outline" className="h-8 border-[#D4AF37]/30 text-[#D4AF37] text-[8px] font-black">+BOT</Button>
+                      <Button onClick={deletePlayersAndHistory} variant="outline" className="h-8 border-red-900/40 text-red-500 text-[8px] font-black uppercase">CANCELLA GIOCATORI</Button>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2 mt-2">
+                      <Button onClick={resetHand} variant="outline" className="h-8 border-yellow-600/40 text-yellow-500 text-[8px] font-black uppercase">RESET MANO</Button>
+                      <Button onClick={systemWipe} variant="destructive" className="h-8 text-[8px] font-black uppercase">SYSTEM WIPE</Button>
+                    </div>
+
+                    <div className="pt-2 border-t border-white/5 space-y-1">
+                      <p className="text-[7px] text-white/30 text-center uppercase font-black">Assegna LAS VEGAS</p>
+                      <div className="flex flex-wrap gap-1 justify-center">
+                        {Object.values(players).map(p => <Button key={p.id} onClick={() => calculateWinners(p.id)} variant="ghost" className="h-5 px-1 text-[7px] uppercase font-bold text-yellow-500 hover:bg-yellow-500 hover:text-black">LAS VEGAS: {p.username}</Button>)}
+                      </div>
+                    </div>
+
+                    <Button onClick={() => calculateWinners()} disabled={gameState?.phase !== 'final'} className="w-full h-10 bg-[#50C878] text-black font-black text-[9px] mt-3">FORZA CALCOLO</Button>
+
+                    <div className="pt-2 border-t border-white/5 space-y-1">
+                      <p className="text-[7px] text-white/30 text-center uppercase font-black">Sposta D</p>
+                      <div className="flex flex-wrap gap-1 justify-center">
+                        {Object.values(players).map(p => <Button key={p.id} onClick={() => setManualDealer(p.id)} variant="ghost" className="h-5 px-1 text-[7px] uppercase font-bold hover:bg-[#D4AF37] hover:text-black">{p.username}</Button>)}
+                      </div>
+                    </div>
+                  </CardContent>
+                </Card>
+              )}
+              <Card className="bg-[#D4AF37]/10 border-[#D4AF37]/30 border-2 p-4 text-center"><h3 className="text-lg font-black italic text-[#D4AF37] uppercase">{currentUser?.username}</h3><p className="text-2xl font-black tabular-nums">{currentUser?.balance.toFixed(2)}€</p></Card>
+            </div>
+          )}
+          <Card className="bg-[#004225]/40 border-[#50C878]/30 border-2 p-5 text-center shadow-[inset_0_0_30px_rgba(0,0,0,0.5)]">
+            <span className="text-[#D4AF37] text-[10px] font-black uppercase block tracking-widest">Piatto Totale</span>
+            <span className="text-4xl font-black italic tabular-nums text-white">{gameState?.pot?.toFixed(2) || "0.00"}€</span>
+            <div className="mt-2 text-[9px] uppercase font-black italic text-[#50C878] tracking-[0.2em] border-t border-[#50C878]/20 pt-2">{gameState?.phase?.toUpperCase() || "LOBBY"}</div>
+          </Card>
+
+          <Card className="bg-black/95 border-[#D4AF37]/20 border overflow-hidden shadow-2xl">
+            <CardHeader className="bg-[#D4AF37]/10 py-2 px-4 flex flex-row items-center gap-2 border-b border-white/5"><History className="w-3 h-3 text-[#D4AF37]" /><CardTitle className="text-[#D4AF37] text-[9px] font-black uppercase tracking-widest">🏆 Ultime Vincite</CardTitle></CardHeader>
+            <CardContent className="p-0 max-h-[250px] overflow-y-auto custom-scrollbar bg-black/40">
+              {winHistory.length > 0 ? winHistory.map((h, i) => (
+                <div key={i} className="px-4 py-3 border-b border-white/5 flex justify-between items-center hover:bg-white/5 transition-colors">
+                  <div className="flex flex-col gap-1"><span className="text-[10px] font-black uppercase text-white/90 leading-none">{h.winners}</span><span className="text-[8px] text-white/30 uppercase font-bold">{new Date(h.timestamp).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}</span></div>
+                  <span className="text-[#D4AF37] font-black text-sm tabular-nums">+{h.pot.toFixed(2)}€</span>
+                </div>
+              )) : <div className="p-6 text-center text-white/20 text-[9px] uppercase font-black tracking-widest italic">Nessun dato registrato</div>}
+            </CardContent>
+          </Card>
+        </div>
+
+        <div className="lg:col-span-9 space-y-4 flex flex-col h-full md:scale-95 origin-top transition-transform">
+          <div className="bg-[#004225] border-[10px] md:border-[14px] border-[#D4AF37]/30 rounded-[50px] md:rounded-[70px] p-4 md:p-8 min-h-[300px] md:min-h-[450px] flex items-center justify-center relative shadow-[inset_0_0_120px_rgba(0,0,0,0.9)] border-double">
+            <div className="flex flex-wrap gap-2 md:gap-4 justify-center items-center w-full relative z-20">
+              {Array.from({ length: gameState?.totalCards || 5 }).map((_, idx) => {
+                const card = gameState?.revealedCards?.[idx];
+                const rev = !!card;
+                const isDuplicate = gameState?.revealedCards?.some((c, i) => i < idx && c.value === card?.value);
+                if (rev && isDuplicate) return null; // hide duplicates silently
+                return (
+                  <div key={idx} className="w-12 h-20 md:w-20 md:h-32 relative perspective-1000">
+                    <motion.div animate={{ rotateY: rev ? 0 : 180 }} transition={{ duration: 0.8, type: "spring" }} style={{ transformStyle: "preserve-3d" }} className="w-full h-full relative">
+                      <div className="absolute inset-0 bg-white rounded-lg md:rounded-xl border-[2px] md:border-[4px] border-[#D4AF37] shadow-2xl backface-hidden flex flex-col items-center justify-between py-1 md:py-2 px-1">
+                        <div className={`w-full flex justify-start pl-1 text-[10px] md:text-sm font-black italic leading-none ${card?.color === 'red' ? 'text-red-600' : 'text-black'}`}>{card?.value}{card?.suit}</div>
+                        <div className={`text-xl md:text-3xl font-black ${card?.color === 'red' ? 'text-red-600' : 'text-black'}`}>{card?.suit}</div>
+                        <div className={`w-full flex justify-end pr-1 text-[10px] md:text-sm font-black italic rotate-180 leading-none ${card?.color === 'red' ? 'text-red-600' : 'text-black'}`}>{card?.value}{card?.suit}</div>
+                      </div>
+                      <div style={{ transform: "rotateY(180deg)" }} className="absolute inset-0 bg-gradient-to-br from-black to-zinc-900 border-2 md:border-4 border-[#D4AF37]/40 rounded-lg md:rounded-xl flex items-center justify-center backface-hidden overflow-hidden shadow-xl">
+                        <div className="w-full h-full bg-[radial-gradient(circle,rgba(212,175,55,0.1)_0%,transparent_70%)] absolute inset-0" /><Trophy className="w-4 h-4 md:w-8 md:h-8 text-[#D4AF37]/15 animate-pulse" />
+                      </div>
+                    </motion.div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Current player's hand (filtered by scarto silenzioso) - placed above the action menu */}
+          {currentUser && (
+            <div className="mx-auto w-full max-w-4xl">
+              <div className="flex gap-3 justify-center items-center mb-3">
+                {(filteredLocalHand || []).map((c, i) => (
+                  <div key={i} className="w-10 h-16 md:w-14 md:h-20 relative perspective-1000">
+                    <div className="absolute inset-0 bg-white rounded-lg md:rounded-xl border-2 border-[#D4AF37] flex flex-col items-center justify-between py-1 px-1">
+                      <div className={`w-full flex justify-start pl-1 text-[10px] font-black italic ${c.color === 'red' ? 'text-red-600' : 'text-black'}`}>{c.value}{c.suit}</div>
+                      <div className={`text-lg font-black ${c.color === 'red' ? 'text-red-600' : 'text-black'}`}>{c.suit}</div>
+                      <div className={`w-full flex justify-end pr-1 text-[10px] font-black italic rotate-180 ${c.color === 'red' ? 'text-red-600' : 'text-black'}`}>{c.value}{c.suit}</div>
+                    </div>
+                  </div>
+                ))}
+                {(filteredLocalHand || []).length === 0 && (currentUser.hand && currentUser.hand.length > 0) && (
+                  <div className="text-[10px] text-white/40 italic uppercase">Tutte le carte scartate</div>
+                )}
+              </div>
+            </div>
+          )}
+
+          <AnimatePresence mode="wait">
+            {(isAdminMode || (gameState?.phase === "betting" && currentUser && gameState.currentPlayerTurn === localPlayerId)) && (
+              <motion.div initial={{ opacity: 0, y: 50 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -50 }} className="relative z-50 my-8 bg-black/95 border-2 border-[#D4AF37] rounded-[30px] md:rounded-[50px] p-4 md:p-6 shadow-[0_0_50px_rgba(212,175,55,0.2)] mx-auto w-full max-w-4xl">
+                <div className="flex flex-col md:flex-row gap-4 md:gap-8 items-center">
+                  <div className="flex-1 w-full space-y-4">
+                    <div className="flex justify-between items-end"><span className="text-3xl md:text-4xl font-black italic tabular-nums text-white">{betAmount.toFixed(2)}€</span><span className="text-base md:text-sm font-black italic text-[#50C878] truncate">Saldo: {currentUser ? (currentUser.balance - (betAmount - currentUser.lastBet)).toFixed(2) : "0.00"}€</span></div>
+                    <Slider value={[betAmount]} onValueChange={v => setBetAmount(v[0])} min={0.10} max={2.00} step={0.1} className="py-2 md:py-4 [&_[role=slider]]:bg-[#D4AF37] [&_[role=slider]]:h-6 md:[&_[role=slider]]:h-8 [&_[role=slider]]:w-6 md:[&_[role=slider]]:w-8 [&_[role=slider]]:border-2 md:[&_[role=slider]]:border-4 [&_[role=slider]]:border-black [&_[role=slider]]:shadow-xl" />
+                  </div>
+                  <div className="flex gap-2 w-full md:w-auto">
+                    <Button onClick={handleCheck} disabled={currentUser?.lastBet !== gameState?.currentBet && !isAdminMode} className="h-12 md:h-10 flex-1 md:py-1 md:px-3 bg-black border-2 border-[#D4AF37]/40 text-[#D4AF37] font-black text-lg md:text-[10px] italic rounded-xl uppercase break-words">CHECK</Button>
+                    <Button onClick={handleBet} className="h-12 md:h-10 flex-1 md:py-1 md:px-3 bg-[#50C878] text-black font-black text-xl md:text-[10px] italic rounded-xl shadow-[0_4px_0_#004225] active:translate-y-1 active:shadow-none transition-all uppercase break-words">PUNTA</Button>
+                    <Button onClick={handleFold} className="h-12 md:h-10 flex-1 md:py-1 md:px-3 bg-red-600 text-white font-black text-xl md:text-[10px] italic rounded-xl shadow-[0_4px_0_#7f1d1d] active:translate-y-1 active:shadow-none transition-all uppercase break-words">FOLD</Button>
+                  </div>
+                </div>
+              </motion.div>
+            )}
+            {gameState?.phase === "final" && currentUser && !currentUser.choice && (
+              <motion.div initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} className="bg-black/98 border-4 border-zinc-500 rounded-[60px] p-12 text-center space-y-8 mx-auto w-full max-w-2xl shadow-2xl">
+                <h2 className="text-5xl font-black italic uppercase tracking-tighter text-white">DICHIARAZIONE FINALE</h2>
+                <div className="space-y-2"><p className="text-[10px] text-white/40 font-black uppercase tracking-[0.3em]">Inserisci il tuo punteggio totale</p><Input type="number" className="h-24 text-center text-6xl font-black bg-black/50 border-4 border-zinc-500/40 text-white rounded-3xl" value={finalScoreInput} onChange={e => setFinalScoreInput(e.target.value)} placeholder="0" /></div>
+                <div className="flex gap-6"><Button onClick={() => submitFinal("min")} className="flex-1 h-24 bg-zinc-700 text-white font-black text-3xl rounded-3xl shadow-[0_8px_0_#3f3f46] active:translate-y-2 active:shadow-none">MIN</Button><Button onClick={() => submitFinal("max")} className="flex-1 h-24 bg-zinc-700 text-white font-black text-3xl rounded-3xl shadow-[0_8px_0_#3f3f46] active:translate-y-2 active:shadow-none">MAX</Button></div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          <div className="grid grid-cols-1 xs:grid-cols-2 md:grid-cols-4 gap-2 md:gap-4 w-full">
+            {Object.values(players).sort((a,b) => a.position - b.position).map(p => (
+              <motion.div key={p.id} layout className={`p-3 md:p-4 rounded-[30px] border-2 relative transition-all duration-500 shadow-xl ${p.id === localPlayerId ? 'border-[#D4AF37] bg-[#D4AF37]/15' : 'border-white/5 bg-black/70'} ${gameState?.currentPlayerTurn === p.id ? 'ring-2 ring-[#50C878] scale-105 z-30' : ''}`}>
+                {gameState?.dealerIndex === p.position && <div className="absolute -top-2 left-1/2 -translate-x-1/2 w-8 h-8 md:w-10 md:h-10 bg-gradient-to-br from-[#D4AF37] via-[#FFD700] to-[#996515] rounded-full flex items-center justify-center text-black font-black text-sm md:text-lg border-2 border-black/50 shadow-2xl z-40">D</div>}
+                <div className="flex flex-col items-center text-center space-y-2 pt-2">
+                  <div className="flex flex-col items-center gap-1">
+                    <span className="text-[10px] md:text-xs font-black uppercase text-white/50 tracking-wider truncate w-full max-w-[100px] break-words">{p.username}</span>
+                    {p.isAdmin && <Badge className="bg-[#D4AF37] text-black text-[7px] font-black h-3 px-1 border-none">BOSS</Badge>}
+                  </div>
+
+                  <div className="text-xl md:text-2xl font-black italic tabular-nums text-white">
+                    {/* Privacy: show balance only for local player or during results */}
+                    { (p.id === localPlayerId || gameState?.phase === 'results') ? `${p.balance.toFixed(2)}€` : (p.folded ? 'FOLDED' : (p.lastBet > 0 ? `Punta ${p.lastBet.toFixed(2)}€` : '')) }
+                  </div>
+
+                  <div className="h-12 md:h-14 flex flex-col justify-center items-center w-full gap-1">
+                    {/* Show minimal last action (bet or fold) for privacy */}
+                    {p.lastBet > 0 && <Badge className="bg-[#50C878]/10 text-[#50C878] text-[8px] md:text-[9px] font-black border-[#50C878]/30 uppercase px-2 py-0">Bet: {p.lastBet.toFixed(2)}€</Badge>}
+                    {p.folded && <Badge className="bg-red-700 text-white text-[8px] md:text-[9px] font-black uppercase px-2 py-0">FOLD</Badge>}
+
+                    {/* Show choice and finalScore only in results for everyone; local player can always see own declaration */}
+                    {(((p.id === localPlayerId) && p.choice) || gameState?.phase === 'results') && p.choice && <Badge className={`w-full justify-center text-[9px] md:text-[10px] font-black italic rounded-lg ${gameState?.phase === 'results' ? (p.choice === 'min' ? 'bg-blue-600' : 'bg-red-600') : 'bg-zinc-800 text-[#D4AF37] border border-[#D4AF37]/30'} border-none uppercase py-0.5`}>{gameState?.phase === 'results' ? p.choice : 'DICHIARATO'}</Badge>}
+                    {(gameState?.phase === 'results') && p.finalScore !== undefined && <span className="text-[10px] md:text-[11px] font-black text-[#D4AF37] mt-0.5">PUNTI: {p.finalScore}</span>}
+                  </div>
+                  {/* Admin button to set this player as dealer */}
+                  {isAdminMode && gameState?.dealerIndex !== p.position && (
+                    <Button onClick={() => setManualDealer(p.id)} variant="ghost" className="mt-2 h-6 px-2 text-[10px] text-[#D4AF37] hover:bg-[#D4AF37]/20 font-black uppercase border border-[#D4AF37]/30 rounded-full">D</Button>
+                  )}
+                </div>
+              </motion.div>
+            ))}
+          </div>
+        </div>
+      </main>
+
+      <style>{` .perspective-1000 { perspective: 1000px; } .backface-hidden { backface-visibility: hidden; } .custom-scrollbar::-webkit-scrollbar { width: 5px; } .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(212, 175, 55, 0.3); border-radius: 10px; } `}</style>
     </div>
   );
 }
