@@ -1,3 +1,5 @@
+[file name]: Home.tsx
+[file content begin]
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useFirebaseConnection } from "@/hooks/use-firebase-connection";
 import { db } from "@/lib/firebase";
@@ -482,14 +484,35 @@ export default function Home() {
     }
   }, [gameState, players, isConnected, isAdminMode, getNextActivePlayerId]);
 
+  // FUNZIONE JOIN GAME CON CONTROLLO UNICITÀ NOME
   const joinGame = () => {
     if (!usernameInput.trim() || !budgetInput.trim()) return;
+
+    // Controllo unicità del nome (case-insensitive)
+    const username = usernameInput.trim();
+    const existingPlayers = Object.values(players);
+    const usernameExists = existingPlayers.some(
+      (p) =>
+        p &&
+        p.username.toLowerCase() === username.toLowerCase() &&
+        !p.folded
+    );
+
+    if (usernameExists) {
+      toast({
+        title: "Nome già in uso",
+        description: "Un giocatore con questo nome è già presente nella partita.",
+        variant: "destructive",
+      });
+      return;
+    }
+
     const uniqueId = db.ref("game/players").push().key!;
     localStorage.setItem("poker_player_id", uniqueId);
     setLocalPlayerId(uniqueId);
     db.ref(`game/players/${uniqueId}`).set({
       id: uniqueId,
-      username: usernameInput.trim(),
+      username: username,
       balance: parseFloat(budgetInput),
       isAdmin: false,
       isBot: false,
@@ -579,7 +602,7 @@ export default function Home() {
     db.ref().update(updates);
   };
 
-  // FUNZIONE CORRETTA E RAFFORZATA: Applica scarto silenzioso
+  // FUNZIONE CORRETTA E RAFFORZATA: Applica scarto silenzioso (SCARTA SOLO DALLE MANI, MAI DAL TAVOLO)
   const applySilentDiscard = () => {
     if (!gameState || !players) return;
 
@@ -607,11 +630,18 @@ export default function Home() {
 
         updates[`game/players/${id}/hand`] = newHand;
 
+        // AGGIUNGI TUTTE LE CARTE SCARTATE ALL'ARRAY DISCARDEDCARDS
         const currentDiscarded = player.discardedCards || [];
-        updates[`game/players/${id}/discardedCards`] = [
-          ...currentDiscarded,
-          ...cardsToDiscard,
-        ];
+        const updatedDiscarded = [...currentDiscarded, ...cardsToDiscard];
+        
+        // Elimina eventuali duplicati mantenendo l'ordine
+        const uniqueDiscarded = updatedDiscarded.filter((card, index, self) =>
+          index === self.findIndex((c) => 
+            c.value === card.value && c.suit === card.suit
+          )
+        );
+        
+        updates[`game/players/${id}/discardedCards`] = uniqueDiscarded;
 
         console.log(`🔄 Scarto silenzioso per ${player.username}:`);
         console.log(
@@ -744,7 +774,6 @@ export default function Home() {
     const availableValues = VALUES.filter((v) => !revealedValues.includes(v));
 
     if (availableValues.length === 0) {
-      // Non ci sono più valori unici disponibili (non dovrebbe accadere con max 6 carte)
       toast({
         title: "Errore",
         description: "Non ci sono più valori unici disponibili per il tavolo!",
@@ -767,10 +796,6 @@ export default function Home() {
     console.log(`🎴 Svelo nuova carta UNICA: ${value}${suit.symbol}`);
     console.log(`📊 Carte sul tavolo prima: ${currentRevealed.length}`);
     console.log(`📊 Carte sul tavolo dopo: ${nextRevealed.length}`);
-    console.log(`📊 Valori già usati: ${revealedValues.join(", ")}`);
-    console.log(
-      `📊 Valori ancora disponibili: ${availableValues.filter((v) => v !== value).join(", ")}`,
-    );
 
     if (nextRevealed.length >= gameState.totalCards) {
       db.ref("game/state").update({
@@ -868,8 +893,7 @@ export default function Home() {
     });
   };
 
-  // FUNZIONE PUNTATA MIGLIORATA CON LIMITE MAX 2.00
-  // FUNZIONE PUNTATA MIGLIORATA CON LIMITE MAX 2.00
+  // FUNZIONE PUNTATA MIGLIORATA CON LIMITE MASSIMO DI 2.00€ e OBBLIGO DI RILANCIO
   const handleBet = () => {
     if (
       !gameState ||
@@ -889,15 +913,29 @@ export default function Home() {
 
     let betVal = parseFloat(betAmount.toFixed(2));
 
-    // --- QUESTA È LA MODIFICA PRINCIPALE NELLA LOGICA ---
-    // LIMITE DI SICUREZZA 2.00
+    // CONTROLLO SICUREZZA: Limita la puntata a massimo 2.00€
     if (betVal > 2.00) {
-        betVal = 2.00;
+      betVal = 2.00;
+      setBetAmount(2.00);
+      toast({
+        title: "Limite di puntata",
+        description: "La puntata massima consentita è 2.00€",
+        variant: "default",
+        duration: 2000,
+      });
     }
-    // ----------------------------------------------------
+
+    // OBBLIGO DI RILANCIO: Non puoi puntare meno del currentBet
+    if (betVal < gameState.currentBet) {
+      toast({
+        title: "Puntata non valida",
+        description: `Devi puntare almeno ${gameState.currentBet.toFixed(2)}€ (current bet)`,
+        variant: "destructive",
+      });
+      return;
+    }
 
     const lastBet = currentUser.lastBet || 0;
-    // ... resto della funzione
 
     const diff = Math.max(0, parseFloat((betVal - lastBet).toFixed(2)));
 
@@ -963,6 +1001,12 @@ export default function Home() {
       db.ref("game/state").update({
         lastAction: `${currentUser.username} fa Check`,
         currentPlayerTurn: nextPlayerId || "",
+      });
+    } else {
+      toast({
+        title: "Check non consentito",
+        description: `Devi pareggiare la puntata (${gameState.currentBet.toFixed(2)}€) per fare check`,
+        variant: "destructive",
       });
     }
   };
@@ -1307,9 +1351,12 @@ export default function Home() {
     window.location.reload();
   };
 
+  // FUNZIONE ROBUSTA: Imposta dealer con controllo anti-duplicato
   const setManualDealer = (id: string) => {
     const p = players[id];
     if (p) {
+      // Aggiorna in modo atomico il dealerIndex nello stato del gioco
+      // Questo garantisce che ci sia un solo dealer
       db.ref("game/state").update({
         dealerIndex: p.position,
         lastAction: `Dealer selezionato: ${p.username}. Clicca AVANTI per continuare.`,
@@ -1366,7 +1413,7 @@ export default function Home() {
       </div>
 
       <AnimatePresence>
-        {/* POPUP DEBUG SCARTI - MODIFICATO: Mostra SOLO le carte scartate nel turno */}
+        {/* POPUP DEBUG SCARTI - MODIFICATO: Mostra TUTTE le carte scartate dall'inizio della mano */}
         {showDebugPopup && (
           <motion.div
             initial={{ opacity: 0 }}
@@ -1382,7 +1429,7 @@ export default function Home() {
             >
               <div className="bg-[#D4AF37]/10 p-6 border-b border-[#D4AF37]/30 flex justify-between items-center">
                 <h2 className="text-2xl font-black italic text-[#D4AF37] uppercase tracking-tighter">
-                  🃏 Debug Carte Scartate nel Turno
+                  🃏 Debug Carte Scartate (Tutte)
                 </h2>
                 <Button
                   onClick={() => setShowDebugPopup(false)}
@@ -1424,14 +1471,14 @@ export default function Home() {
                           )}
                         </div>
                         <span className="text-[10px] text-white/40">
-                          {discardedCards.length} carte scartate nel turno
+                          {discardedCards.length} carte scartate in totale
                         </span>
                       </div>
 
                       {discardedCards.length > 0 ? (
                         <div className="space-y-3">
                           <p className="text-[10px] text-white/60 uppercase font-bold">
-                            Carte scartate in questo turno (visibili a tutti):
+                            Carte scartate dall'inizio della mano:
                           </p>
                           <div className="flex flex-wrap gap-2">
                             {discardedCards.map((card, idx) => (
@@ -1455,7 +1502,7 @@ export default function Home() {
                         </div>
                       ) : (
                         <div className="text-center py-4 text-white/30 text-sm italic">
-                          Nessuna carta scartata in questo turno
+                          Nessuna carta scartata
                         </div>
                       )}
                     </div>
@@ -1468,9 +1515,9 @@ export default function Home() {
                     ℹ️ Informazioni Debug
                   </p>
                   <p className="text-[9px] text-white/60">
-                    Questo popup mostra SOLO le carte scartate nel turno corrente.
+                    Questo popup mostra TUTTE le carte scartate dall'inizio della mano corrente.
                     Le carte vengono automaticamente scartate quando viene rivelata 
-                    una carta con lo stesso valore sul tavolo.
+                    una carta con lo stesso valore sul tavolo (scarto silenzioso).
                   </p>
                 </div>
               </div>
@@ -1971,7 +2018,6 @@ export default function Home() {
                 (_, idx) => {
                   const card = (gameState?.revealedCards || [])[idx];
                   const rev = !!card;
-                  // Mostra TUTTE le carte, ora sono garantite uniche
                   return (
                     <div
                       key={idx}
@@ -2015,13 +2061,6 @@ export default function Home() {
                 },
               )}
             </div>
-            {/* Contatore carte sul tavolo per debug */}
-            {debugScartoRef.current && gameState?.revealedCards && (
-              <div className="absolute bottom-4 right-4 bg-black/70 text-white px-3 py-1 rounded-lg text-xs font-bold">
-                Carte sul tavolo: {gameState.revealedCards.length} (TUTTE
-                UNICHE)
-              </div>
-            )}
           </div>
 
           {currentUser && (
@@ -2100,13 +2139,12 @@ export default function Home() {
                       <Slider
                         value={[betAmount]}
                         onValueChange={(v) => setBetAmount(v[0])}
-                        min={0.1}
-                        // --- QUESTA È LA MODIFICA NELL'INTERFACCIA ---
-                        // Il massimo è il minimo tra 2.0 e il saldo dell'utente
+                        // OBBLIGO DI RILANCIO: minimo = currentBet (ma non meno di 0.1)
+                        min={Math.max(0.1, gameState?.currentBet || 0.1)}
+                        // LIMITE MASSIMO: 2.00€ o il saldo disponibile
                         max={Math.min(2.0, currentUser?.balance || 2.0)}
-                        // ---------------------------------------------
                         step={0.1}
-                        className="py-2 md:py-4 [&_[role=slider]]:bg-[#D4AF37] ..."
+                        className="py-2 md:py-4 [&_[role=slider]]:bg-[#D4AF37] [&_[role=slider]]:h-6 md:[&_[role=slider]]:h-8 [&_[role=slider]]:w-6 md:[&_[role=slider]]:w-8 [&_[role=slider]]:border-2 md:[&_[role=slider]]:border-4 [&_[role=slider]]:border-black [&_[role=slider]]:shadow-xl"
                       />
                     </div>
                     <div className="flex gap-2 w-full md:w-auto">
@@ -2267,3 +2305,4 @@ export default function Home() {
     </div>
   );
 }
+[file content end]
