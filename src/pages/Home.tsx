@@ -1,5 +1,3 @@
-[file name]: Home.tsx
-[file content begin]
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useFirebaseConnection } from "@/hooks/use-firebase-connection";
 import { db } from "@/lib/firebase";
@@ -161,17 +159,6 @@ function getFilteredHand(
   return filtered;
 }
 
-function getDiscardedCards(player: Player): CardObj[] {
-  if (!player.originalHand || !player.hand) return [];
-
-  const originalValues = player.originalHand.map((c) => `${c.value}${c.suit}`);
-  const currentValues = player.hand.map((c) => `${c.value}${c.suit}`);
-
-  return player.originalHand.filter(
-    (card) => !currentValues.includes(`${card.value}${c.suit}`),
-  );
-}
-
 export default function Home() {
   const { isConnected, isInitialized } = useFirebaseConnection();
   const { toast } = useToast();
@@ -222,6 +209,14 @@ export default function Home() {
     const nextIndex = (currentIndex + 1) % playerList.length;
     return playerList[nextIndex].id;
   }, [gameState, players]);
+
+  // EFFETTO PER RESETTARE BETAMOUNT QUANDO CAMBIA IL TURNO DEL GIOCATORE
+  useEffect(() => {
+    if (gameState && localPlayerId && gameState.currentPlayerTurn === localPlayerId) {
+      const currentBet = gameState.currentBet || 0.1;
+      setBetAmount(currentBet);
+    }
+  }, [gameState, localPlayerId]);
 
   // NOTIFICA LAS VEGAS
   useEffect(() => {
@@ -2241,7 +2236,7 @@ export default function Home() {
                         value={[betAmount]}
                         onValueChange={(v) => setBetAmount(v[0])}
                         // DYNAMIC MINIMUM BET: il minimo è il currentBet (ma almeno 0.1)
-                        min={Math.max(0.1, gameState?.currentBet || 0.1)}
+                        min={gameState?.currentBet || 0.1}
                         // Massimo: 2.00€ o il saldo disponibile
                         max={Math.min(2.0, currentUser?.balance || 2.0)}
                         step={0.1}
@@ -2406,4 +2401,3 @@ export default function Home() {
     </div>
   );
 }
-[file content end]
