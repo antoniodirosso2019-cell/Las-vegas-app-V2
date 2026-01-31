@@ -869,6 +869,7 @@ export default function Home() {
   };
 
   // FUNZIONE PUNTATA MIGLIORATA CON LIMITE MAX 2.00
+  // FUNZIONE PUNTATA MIGLIORATA CON LIMITE MAX 2.00
   const handleBet = () => {
     if (
       !gameState ||
@@ -888,12 +889,15 @@ export default function Home() {
 
     let betVal = parseFloat(betAmount.toFixed(2));
 
+    // --- QUESTA È LA MODIFICA PRINCIPALE NELLA LOGICA ---
     // LIMITE DI SICUREZZA 2.00
     if (betVal > 2.00) {
         betVal = 2.00;
     }
+    // ----------------------------------------------------
 
     const lastBet = currentUser.lastBet || 0;
+    // ... resto della funzione
 
     const diff = Math.max(0, parseFloat((betVal - lastBet).toFixed(2)));
 
@@ -2097,9 +2101,12 @@ export default function Home() {
                         value={[betAmount]}
                         onValueChange={(v) => setBetAmount(v[0])}
                         min={0.1}
+                        // --- QUESTA È LA MODIFICA NELL'INTERFACCIA ---
+                        // Il massimo è il minimo tra 2.0 e il saldo dell'utente
                         max={Math.min(2.0, currentUser?.balance || 2.0)}
+                        // ---------------------------------------------
                         step={0.1}
-                        className="py-2 md:py-4 [&_[role=slider]]:bg-[#D4AF37] [&_[role=slider]]:h-6 md:[&_[role=slider]]:h-8 [&_[role=slider]]:w-6 md:[&_[role=slider]]:w-8 [&_[role=slider]]:border-2 md:[&_[role=slider]]:border-4 [&_[role=slider]]:border-black [&_[role=slider]]:shadow-xl"
+                        className="py-2 md:py-4 [&_[role=slider]]:bg-[#D4AF37] ..."
                       />
                     </div>
                     <div className="flex gap-2 w-full md:w-auto">
