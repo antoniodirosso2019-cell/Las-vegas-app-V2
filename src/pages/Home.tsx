@@ -322,7 +322,7 @@ export default function Home() {
     }
   }, [currentUser, gameState]);
 
-  // LOGICA BOT MIGLIORATA
+  // LOGICA BOT MIGLIORATA CON BLOCCAGGIO DURANTE WAITING FOR DEALER
   useEffect(() => {
     if (
       !gameState ||
@@ -484,12 +484,30 @@ export default function Home() {
     }
   }, [gameState, players, isConnected, isAdminMode, getNextActivePlayerId]);
 
-  // FUNZIONE JOIN GAME CON CONTROLLO UNICITÀ NOME
+  // FUNZIONE JOIN GAME CON CONTROLLO NOMI DUPLICATI COMPLETO
   const joinGame = () => {
-    if (!usernameInput.trim() || !budgetInput.trim()) return;
+    if (!usernameInput.trim() || !budgetInput.trim()) {
+      toast({
+        title: "Campi mancanti",
+        description: "Inserisci nome e budget per giocare",
+        variant: "destructive",
+      });
+      return;
+    }
 
-    // Controllo unicità del nome (case-insensitive)
     const username = usernameInput.trim();
+    const budget = parseFloat(budgetInput);
+
+    if (budget <= 0) {
+      toast({
+        title: "Budget non valido",
+        description: "Il budget deve essere maggiore di 0",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    // CONTROLLO UNICITÀ DEL NOME (case-insensitive)
     const existingPlayers = Object.values(players);
     const usernameExists = existingPlayers.some(
       (p) =>
@@ -513,7 +531,7 @@ export default function Home() {
     db.ref(`game/players/${uniqueId}`).set({
       id: uniqueId,
       username: username,
-      balance: parseFloat(budgetInput),
+      balance: budget,
       isAdmin: false,
       isBot: false,
       lastBet: 0,
@@ -527,43 +545,91 @@ export default function Home() {
       totalBetThisHand: 0,
       discardedCards: [],
     });
+
+    toast({
+      title: "Benvenuto!",
+      description: `${username} è entrato nel gioco con ${budget}€`,
+    });
   };
 
   const isDiro = tempName.toLowerCase() === "diro";
 
+  // FUNZIONE ADMIN LOGIN CON CONTROLLO NOMI DUPLICATI
   const handleAdminLogin = () => {
-    if (adminPassword === "1234" && isDiro) {
-      if (!budgetInput) return;
-      const adminId =
-        localStorage.getItem("poker_player_id") ||
-        db.ref("game/players").push().key!;
-      localStorage.setItem("poker_player_id", adminId);
-      setLocalPlayerId(adminId);
-      setIsAdminMode(true);
-      db.ref(`game/players/${adminId}`).set({
-        id: adminId,
-        username: "diro",
-        balance: parseFloat(budgetInput),
-        isAdmin: true,
-        isBot: false,
-        lastBet: 0,
-        position: 0,
-        hasActed: false,
-        folded: false,
-        choice: null,
-        finalScore: null,
-        hand: null,
-        originalHand: null,
-        totalBetThisHand: 0,
-        discardedCards: [],
-      });
-    } else {
+    if (adminPassword !== "1234" || !isDiro) {
       toast({
         title: "Errore",
         description: "Password errata o nome non autorizzato.",
         variant: "destructive",
       });
+      return;
     }
+
+    if (!budgetInput) {
+      toast({
+        title: "Budget mancante",
+        description: "Inserisci un budget per l'admin",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    const budget = parseFloat(budgetInput);
+    if (budget <= 0) {
+      toast({
+        title: "Budget non valido",
+        description: "Il budget deve essere maggiore di 0",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    // CONTROLLO UNICITÀ DEL NOME "diro"
+    const existingPlayers = Object.values(players);
+    const diroExists = existingPlayers.some(
+      (p) =>
+        p &&
+        p.username.toLowerCase() === "diro" &&
+        !p.folded
+    );
+
+    if (diroExists) {
+      toast({
+        title: "Admin già presente",
+        description: "L'admin 'diro' è già nel gioco",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    const adminId =
+      localStorage.getItem("poker_player_id") ||
+      db.ref("game/players").push().key!;
+    localStorage.setItem("poker_player_id", adminId);
+    setLocalPlayerId(adminId);
+    setIsAdminMode(true);
+    db.ref(`game/players/${adminId}`).set({
+      id: adminId,
+      username: "diro",
+      balance: budget,
+      isAdmin: true,
+      isBot: false,
+      lastBet: 0,
+      position: 0,
+      hasActed: false,
+      folded: false,
+      choice: null,
+      finalScore: null,
+      hand: null,
+      originalHand: null,
+      totalBetThisHand: 0,
+      discardedCards: [],
+    });
+
+    toast({
+      title: "Accesso Admin",
+      description: "Accesso come diro completato",
+    });
   };
 
   const handleLogout = () => {
@@ -602,7 +668,7 @@ export default function Home() {
     db.ref().update(updates);
   };
 
-  // FUNZIONE CORRETTA E RAFFORZATA: Applica scarto silenzioso (SCARTA SOLO DALLE MANI, MAI DAL TAVOLO)
+  // FUNZIONE CORRETTA PER SCARTO SILENZIOSO - SCARTA SOLO DALLE MANI, MAI DAL TAVOLO
   const applySilentDiscard = () => {
     if (!gameState || !players) return;
 
@@ -617,6 +683,7 @@ export default function Home() {
       const player = players[id];
       if (!player || !player.hand || player.hand.length === 0) return;
 
+      // Trova tutte le carte nella mano del giocatore che hanno lo stesso valore di quella rivelata
       const cardsToDiscard = player.hand.filter(
         (card) => card.value === lastRevealedCard.value,
       );
@@ -624,17 +691,18 @@ export default function Home() {
       if (cardsToDiscard.length > 0) {
         anyDiscard = true;
 
+        // Rimuovi solo dalla mano del giocatore
         const newHand = player.hand.filter(
           (card) => card.value !== lastRevealedCard.value,
         );
 
         updates[`game/players/${id}/hand`] = newHand;
 
-        // AGGIUNGI TUTTE LE CARTE SCARTATE ALL'ARRAY DISCARDEDCARDS
+        // Aggiungi le carte scartate all'array discardedCards
         const currentDiscarded = player.discardedCards || [];
         const updatedDiscarded = [...currentDiscarded, ...cardsToDiscard];
         
-        // Elimina eventuali duplicati mantenendo l'ordine
+        // Rimuovi eventuali duplicati mantenendo l'ordine
         const uniqueDiscarded = updatedDiscarded.filter((card, index, self) =>
           index === self.findIndex((c) => 
             c.value === card.value && c.suit === card.suit
@@ -733,7 +801,7 @@ export default function Home() {
       dealerIndex,
       lastAction: `Inizio partita: ${handSize} carte in mano, ${totalCards} carte a terra. Seleziona il dealer e clicca AVANTI.`,
       currentPlayerTurn: "",
-      waitingForDealer: true,
+      waitingForDealer: true, // IMPORTANTE: blocca tutto finché il dealer non viene impostato
       isFirstHand: true,
     });
 
@@ -794,8 +862,6 @@ export default function Home() {
     const nextRevealed = [...currentRevealed, nextCard];
 
     console.log(`🎴 Svelo nuova carta UNICA: ${value}${suit.symbol}`);
-    console.log(`📊 Carte sul tavolo prima: ${currentRevealed.length}`);
-    console.log(`📊 Carte sul tavolo dopo: ${nextRevealed.length}`);
 
     if (nextRevealed.length >= gameState.totalCards) {
       db.ref("game/state").update({
@@ -814,13 +880,14 @@ export default function Home() {
       });
 
       setTimeout(() => {
+        // Applica scarto silenzioso SOLO dalle mani dei giocatori
         applySilentDiscard();
 
         db.ref("game/state").update({
           phase: "betting",
           currentBet: 0,
           currentPlayerTurn: "",
-          waitingForDealer: true,
+          waitingForDealer: true, // IMPORTANTE: blocca tutto finché il dealer non viene impostato
           isFirstHand: false,
           lastAction: `Carta svelata: ${value}${suit.symbol}. Seleziona il dealer per il nuovo giro.`,
         });
@@ -870,11 +937,19 @@ export default function Home() {
   };
 
   const handleAddBot = () => {
-    const r = db.ref("game/players").push();
-    const botId = r.key!;
-    const name = `Bot_${Math.floor(Math.random() * 1000)}`;
+    // Genera un nome unico per il bot
+    const botNames = ["Bot_Alpha", "Bot_Beta", "Bot_Gamma", "Bot_Delta", "Bot_Epsilon"];
+    const usedNames = Object.values(players).map(p => p.username);
+    const availableNames = botNames.filter(name => !usedNames.includes(name));
+    
+    const name = availableNames.length > 0 
+      ? availableNames[0] 
+      : `Bot_${Math.floor(Math.random() * 1000)}`;
+    
     const pos = Object.keys(players).length;
-    r.set({
+    const botId = db.ref("game/players").push().key!;
+    
+    db.ref(`game/players/${botId}`).set({
       id: botId,
       username: name,
       balance: 100,
@@ -891,9 +966,14 @@ export default function Home() {
       totalBetThisHand: 0,
       discardedCards: [],
     });
+
+    toast({
+      title: "Bot aggiunto",
+      description: `Bot ${name} aggiunto al gioco`,
+    });
   };
 
-  // FUNZIONE PUNTATA MIGLIORATA CON LIMITE MASSIMO DI 2.00€ e OBBLIGO DI RILANCIO
+  // FUNZIONE PUNTATA MIGLIORATA CON DYNAMIC MINIMUM BET
   const handleBet = () => {
     if (
       !gameState ||
@@ -909,7 +989,14 @@ export default function Home() {
       return;
     }
 
-    if (!isAdminMode && gameState.currentPlayerTurn !== localPlayerId) return;
+    if (!isAdminMode && gameState.currentPlayerTurn !== localPlayerId) {
+      toast({
+        title: "Non è il tuo turno",
+        description: "Attendi il tuo turno per puntare",
+        variant: "destructive",
+      });
+      return;
+    }
 
     let betVal = parseFloat(betAmount.toFixed(2));
 
@@ -925,11 +1012,12 @@ export default function Home() {
       });
     }
 
-    // OBBLIGO DI RILANCIO: Non puoi puntare meno del currentBet
-    if (betVal < gameState.currentBet) {
+    // DYNAMIC MINIMUM BET: Non puoi puntare meno del currentBet
+    const minBet = gameState.currentBet || 0.1;
+    if (betVal < minBet) {
       toast({
         title: "Puntata non valida",
-        description: `Devi puntare almeno ${gameState.currentBet.toFixed(2)}€ (current bet)`,
+        description: `Devi puntare almeno ${minBet.toFixed(2)}€ (current bet)`,
         variant: "destructive",
       });
       return;
@@ -993,7 +1081,14 @@ export default function Home() {
       return;
     }
 
-    if (!isAdminMode && gameState.currentPlayerTurn !== localPlayerId) return;
+    if (!isAdminMode && gameState.currentPlayerTurn !== localPlayerId) {
+      toast({
+        title: "Non è il tuo turno",
+        description: "Attendi il tuo turno per fare check",
+        variant: "destructive",
+      });
+      return;
+    }
 
     if (currentUser.lastBet === gameState.currentBet) {
       const nextPlayerId = getNextActivePlayerId();
@@ -1026,7 +1121,14 @@ export default function Home() {
       return;
     }
 
-    if (!isAdminMode && gameState.currentPlayerTurn !== localPlayerId) return;
+    if (!isAdminMode && gameState.currentPlayerTurn !== localPlayerId) {
+      toast({
+        title: "Non è il tuo turno",
+        description: "Attendi il tuo turno per foldare",
+        variant: "destructive",
+      });
+      return;
+    }
 
     const nextPlayerId = getNextActivePlayerId();
     db.ref(`game/players/${localPlayerId}`).update({
@@ -1256,7 +1358,7 @@ export default function Home() {
       revealedCards: [],
       lastAction: `Mano resettata. Rimborsati ${totalRefund.toFixed(2)}€ a tutti i giocatori`,
       currentPlayerTurn: "",
-      waitingForDealer: false,
+      waitingForDealer: true, // IMPORTANTE: blocca tutto finché il dealer non viene impostato
       isFirstHand: false,
     });
 
@@ -1326,7 +1428,7 @@ export default function Home() {
       handSize: 5,
       lastAction:
         "Tutti i giocatori umani eliminati tranne te. Bot resettati a 100€.",
-      waitingForDealer: false,
+      waitingForDealer: true, // IMPORTANTE: blocca tutto finché il dealer non viene impostato
       currentPlayerTurn: "",
       dealerIndex: 0,
       isFirstHand: true,
@@ -1351,7 +1453,7 @@ export default function Home() {
     window.location.reload();
   };
 
-  // FUNZIONE ROBUSTA: Imposta dealer con controllo anti-duplicato
+  // FUNZIONE ROBUSTA: Imposta dealer con reset precedente
   const setManualDealer = (id: string) => {
     const p = players[id];
     if (p) {
@@ -1413,7 +1515,7 @@ export default function Home() {
       </div>
 
       <AnimatePresence>
-        {/* POPUP DEBUG SCARTI - MODIFICATO: Mostra TUTTE le carte scartate dall'inizio della mano */}
+        {/* POPUP DEBUG SCARTI - Mostra TUTTE le carte scartate dall'inizio */}
         {showDebugPopup && (
           <motion.div
             initial={{ opacity: 0 }}
@@ -1471,7 +1573,7 @@ export default function Home() {
                           )}
                         </div>
                         <span className="text-[10px] text-white/40">
-                          {discardedCards.length} carte scartate in totale
+                          {discardedCards.length} carte scartate totali
                         </span>
                       </div>
 
@@ -1509,7 +1611,6 @@ export default function Home() {
                   );
                 })}
 
-                {/* Informazioni aggiuntive sul debug */}
                 <div className="mt-6 pt-4 border-t border-[#D4AF37]/30">
                   <p className="text-[10px] text-[#D4AF37] font-bold uppercase mb-2">
                     ℹ️ Informazioni Debug
@@ -1525,8 +1626,8 @@ export default function Home() {
           </motion.div>
         )}
 
-        {/* POPUP IMPOSTA DEALER */}
-        {gameState?.waitingForDealer && gameState?.phase === "betting" && (
+        {/* POPUP IMPOSTA DEALER - Blocca tutto finché non viene impostato */}
+        {gameState?.waitingForDealer && (
           <motion.div
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
@@ -1549,7 +1650,7 @@ export default function Home() {
                     : "Nuovo giro: seleziona il dealer"}
                 </p>
                 <p className="text-xs text-white/40 mt-1">
-                  Il dealer parla per primo
+                  Il dealer parla per primo. Tutte le azioni sono bloccate finché il dealer non viene impostato.
                 </p>
               </div>
               <div className="p-6 space-y-4">
@@ -2139,9 +2240,9 @@ export default function Home() {
                       <Slider
                         value={[betAmount]}
                         onValueChange={(v) => setBetAmount(v[0])}
-                        // OBBLIGO DI RILANCIO: minimo = currentBet (ma non meno di 0.1)
+                        // DYNAMIC MINIMUM BET: il minimo è il currentBet (ma almeno 0.1)
                         min={Math.max(0.1, gameState?.currentBet || 0.1)}
-                        // LIMITE MASSIMO: 2.00€ o il saldo disponibile
+                        // Massimo: 2.00€ o il saldo disponibile
                         max={Math.min(2.0, currentUser?.balance || 2.0)}
                         step={0.1}
                         className="py-2 md:py-4 [&_[role=slider]]:bg-[#D4AF37] [&_[role=slider]]:h-6 md:[&_[role=slider]]:h-8 [&_[role=slider]]:w-6 md:[&_[role=slider]]:w-8 [&_[role=slider]]:border-2 md:[&_[role=slider]]:border-4 [&_[role=slider]]:border-black [&_[role=slider]]:shadow-xl"
