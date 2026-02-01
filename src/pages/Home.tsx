@@ -14,6 +14,8 @@ import {
   AlertCircle,
   Eye,
   X,
+  Plus,
+  Minus,
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 
@@ -217,6 +219,46 @@ export default function Home() {
       setBetAmount(currentBet);
     }
   }, [gameState, localPlayerId]);
+
+  // AUTO-FOLD PER BUDGET INSUFFICIENTE
+  useEffect(() => {
+    if (
+      !gameState ||
+      gameState.phase !== "betting" ||
+      gameState.waitingForDealer ||
+      !gameState.currentPlayerTurn
+    ) {
+      return;
+    }
+
+    const currentPlayer = players[gameState.currentPlayerTurn];
+    if (!currentPlayer || currentPlayer.folded) return;
+
+    const currentBet = gameState.currentBet || 0;
+    const lastBet = currentPlayer.lastBet || 0;
+    const diff = Math.max(0, parseFloat((currentBet - lastBet).toFixed(2)));
+
+    // Controlla se il giocatore ha budget insufficiente per pareggiare
+    if (diff > currentPlayer.balance) {
+      const nextPlayerId = getNextActivePlayerId();
+      
+      db.ref(`game/players/${currentPlayer.id}`).update({
+        folded: true,
+        hasActed: true,
+      });
+
+      db.ref("game/state").update({
+        lastAction: `${currentPlayer.username} Fold (saldo insufficiente)`,
+        currentPlayerTurn: nextPlayerId || "",
+      });
+
+      toast({
+        title: "Auto-Fold",
+        description: `Il giocatore ${currentPlayer.username} ha foldato per budget insufficiente`,
+        variant: "destructive",
+      });
+    }
+  }, [gameState, players, getNextActivePlayerId, toast]);
 
   // NOTIFICA LAS VEGAS
   useEffect(() => {
@@ -969,6 +1011,23 @@ export default function Home() {
       title: "Bot aggiunto",
       description: `Bot ${name} aggiunto al gioco`,
     });
+  };
+
+  // FUNZIONI PER INCREMENTO/DECREMENTO BET AMOUNT
+  const incrementBetAmount = () => {
+    const maxBet = Math.min(2.0, currentUser?.balance || 2.0);
+    const newAmount = parseFloat((betAmount + 0.1).toFixed(2));
+    if (newAmount <= maxBet) {
+      setBetAmount(newAmount);
+    }
+  };
+
+  const decrementBetAmount = () => {
+    const minBet = gameState?.currentBet || 0.1;
+    const newAmount = parseFloat((betAmount - 0.1).toFixed(2));
+    if (newAmount >= minBet) {
+      setBetAmount(newAmount);
+    }
   };
 
   // FUNZIONE PUNTATA MIGLIORATA CON SLIDER BLOCCATO SUL RILANCIO
@@ -2195,16 +2254,36 @@ export default function Home() {
                           €
                         </span>
                       </div>
-                      <Slider
-                        value={[betAmount]}
-                        onValueChange={(v) => setBetAmount(v[0])}
-                        // SLIDER BLOCCATO SUL RILANCIO: il minimo è il currentBet
-                        min={gameState?.currentBet || 0.1}
-                        // Massimo: 2.00€ o il saldo disponibile
-                        max={Math.min(2.0, currentUser?.balance || 2.0)}
-                        step={0.1}
-                        className="py-2 md:py-4 [&_[role=slider]]:bg-[#D4AF37] [&_[role=slider]]:h-6 md:[&_[role=slider]]:h-8 [&_[role=slider]]:w-6 md:[&_[role=slider]]:w-8 [&_[role=slider]]:border-2 md:[&_[role=slider]]:border-4 [&_[role=slider]]:border-black [&_[role=slider]]:shadow-xl"
-                      />
+                      <div className="flex items-center gap-2 w-full">
+                        <Button
+                          onClick={decrementBetAmount}
+                          disabled={betAmount <= (gameState?.currentBet || 0.1)}
+                          variant="outline"
+                          className="h-12 w-12 border-[#D4AF37]/40 text-[#D4AF37] font-black text-xl rounded-xl"
+                        >
+                          <Minus className="w-5 h-5" />
+                        </Button>
+                        <div className="flex-1">
+                          <Slider
+                            value={[betAmount]}
+                            onValueChange={(v) => setBetAmount(v[0])}
+                            min={gameState?.currentBet || 0.1}
+                            max={Math.min(2.0, currentUser?.balance || 2.0)}
+                            step={0.1}
+                            className="py-2 md:py-4 [&_[role=slider]]:bg-[#D4AF37] [&_[role=slider]]:h-6 md:[&_[role=slider]]:h-8 [&_[role=slider]]:w-6 md:[&_[role=slider]]:w-8 [&_[role=slider]]:border-2 md:[&_[role=slider]]:border-4 [&_[role=slider]]:border-black [&_[role=slider]]:shadow-xl"
+                          />
+                        </div>
+                        <Button
+                          onClick={incrementBetAmount}
+                          disabled={
+                            betAmount >= Math.min(2.0, currentUser?.balance || 2.0)
+                          }
+                          variant="outline"
+                          className="h-12 w-12 border-[#D4AF37]/40 text-[#D4AF37] font-black text-xl rounded-xl"
+                        >
+                          <Plus className="w-5 h-5" />
+                        </Button>
+                      </div>
                     </div>
                     <div className="flex gap-2 w-full md:w-auto">
                       <Button
