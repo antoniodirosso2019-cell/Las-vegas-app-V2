@@ -210,7 +210,7 @@ export default function Home() {
     return playerList[nextIndex].id;
   }, [gameState, players]);
 
-  // EFFETTO PER RESETTARE BETAMOUNT QUANDO CAMBIA IL TURNO DEL GIOCATORE
+  // RESET BETAMOUNT AL CAMBIO TURNO - SLIDER BLOCCATO SUL RILANCIO
   useEffect(() => {
     if (gameState && localPlayerId && gameState.currentPlayerTurn === localPlayerId) {
       const currentBet = gameState.currentBet || 0.1;
@@ -290,32 +290,6 @@ export default function Home() {
       historyRef.off();
     };
   }, [isConnected, localPlayerId]);
-
-  // EFFETTO PER DEBUG SCARTO SILENZIOSO
-  useEffect(() => {
-    if (debugScartoRef.current && currentUser && gameState) {
-      const filteredHand = getFilteredHand(
-        currentUser.hand,
-        gameState.revealedCards,
-        true,
-      );
-      console.log("=== DEBUG SCARTO SILENZIOSO ===");
-      console.log("Giocatore:", currentUser.username);
-      console.log(
-        "Mano originale:",
-        currentUser.hand?.map((c) => `${c.value}${c.suit}`),
-      );
-      console.log(
-        "Carte rivelate:",
-        gameState.revealedCards?.map((c) => `${c.value}${c.suit}`),
-      );
-      console.log(
-        "Mano filtrata:",
-        filteredHand.map((c) => `${c.value}${c.suit}`),
-      );
-      console.log("=============================");
-    }
-  }, [currentUser, gameState]);
 
   // LOGICA BOT MIGLIORATA CON BLOCCAGGIO DURANTE WAITING FOR DEALER
   useEffect(() => {
@@ -479,7 +453,7 @@ export default function Home() {
     }
   }, [gameState, players, isConnected, isAdminMode, getNextActivePlayerId]);
 
-  // FUNZIONE JOIN GAME CON CONTROLLO NOMI DUPLICATI COMPLETO
+  // FUNZIONE JOIN GAME CON CONTROLLO NOMI DUPLICATI E ECCEZIONE ADMIN
   const joinGame = () => {
     if (!usernameInput.trim() || !budgetInput.trim()) {
       toast({
@@ -511,13 +485,32 @@ export default function Home() {
         !p.folded
     );
 
+    // Se il nome esiste già ma la password è quella dell'admin, permetto l'accesso
     if (usernameExists) {
-      toast({
-        title: "Nome già in uso",
-        description: "Un giocatore con questo nome è già presente nella partita.",
-        variant: "destructive",
-      });
-      return;
+      if (adminPassword === "1234" && username.toLowerCase() === "diro") {
+        // Permetti all'admin di rientrare
+        const existingAdmin = existingPlayers.find(
+          (p) => p.username.toLowerCase() === "diro"
+        );
+        if (existingAdmin) {
+          localStorage.setItem("poker_player_id", existingAdmin.id);
+          setLocalPlayerId(existingAdmin.id);
+          setIsAdminMode(true);
+          
+          toast({
+            title: "Accesso Admin Riuscito",
+            description: "Admin diro è rientrato nella sessione",
+          });
+          return;
+        }
+      } else {
+        toast({
+          title: "Nome già in uso",
+          description: "Un giocatore con questo nome è già presente nella partita.",
+          variant: "destructive",
+        });
+        return;
+      }
     }
 
     const uniqueId = db.ref("game/players").push().key!;
@@ -549,7 +542,7 @@ export default function Home() {
 
   const isDiro = tempName.toLowerCase() === "diro";
 
-  // FUNZIONE ADMIN LOGIN CON CONTROLLO NOMI DUPLICATI
+  // FUNZIONE ADMIN LOGIN CON ECCEZIONE PER NOME DUPLICATO
   const handleAdminLogin = () => {
     if (adminPassword !== "1234" || !isDiro) {
       toast({
@@ -579,51 +572,61 @@ export default function Home() {
       return;
     }
 
-    // CONTROLLO UNICITÀ DEL NOME "diro"
+    // Controlla se l'admin "diro" esiste già
     const existingPlayers = Object.values(players);
-    const diroExists = existingPlayers.some(
-      (p) =>
-        p &&
-        p.username.toLowerCase() === "diro" &&
-        !p.folded
+    const existingAdmin = existingPlayers.find(
+      (p) => p.username.toLowerCase() === "diro" && p.isAdmin
     );
 
-    if (diroExists) {
-      toast({
-        title: "Admin già presente",
-        description: "L'admin 'diro' è già nel gioco",
-        variant: "destructive",
+    let adminId;
+    if (existingAdmin) {
+      // Admin già presente: aggiorna il budget e ripristina la sessione
+      adminId = existingAdmin.id;
+      db.ref(`game/players/${adminId}`).update({
+        balance: budget,
+        folded: false,
+        lastBet: 0,
+        hasActed: false,
+        choice: null,
+        finalScore: null,
+        hand: null,
+        originalHand: null,
+        discardedCards: [],
+        totalBetThisHand: 0,
       });
-      return;
+    } else {
+      // Crea nuovo admin
+      adminId =
+        localStorage.getItem("poker_player_id") ||
+        db.ref("game/players").push().key!;
+      db.ref(`game/players/${adminId}`).set({
+        id: adminId,
+        username: "diro",
+        balance: budget,
+        isAdmin: true,
+        isBot: false,
+        lastBet: 0,
+        position: 0,
+        hasActed: false,
+        folded: false,
+        choice: null,
+        finalScore: null,
+        hand: null,
+        originalHand: null,
+        totalBetThisHand: 0,
+        discardedCards: [],
+      });
     }
 
-    const adminId =
-      localStorage.getItem("poker_player_id") ||
-      db.ref("game/players").push().key!;
     localStorage.setItem("poker_player_id", adminId);
     setLocalPlayerId(adminId);
     setIsAdminMode(true);
-    db.ref(`game/players/${adminId}`).set({
-      id: adminId,
-      username: "diro",
-      balance: budget,
-      isAdmin: true,
-      isBot: false,
-      lastBet: 0,
-      position: 0,
-      hasActed: false,
-      folded: false,
-      choice: null,
-      finalScore: null,
-      hand: null,
-      originalHand: null,
-      totalBetThisHand: 0,
-      discardedCards: [],
-    });
 
     toast({
       title: "Accesso Admin",
-      description: "Accesso come diro completato",
+      description: existingAdmin 
+        ? "Admin diro è rientrato nella sessione" 
+        : "Accesso come diro completato",
     });
   };
 
@@ -663,7 +666,7 @@ export default function Home() {
     db.ref().update(updates);
   };
 
-  // FUNZIONE CORRETTA PER SCARTO SILENZIOSO - SCARTA SOLO DALLE MANI, MAI DAL TAVOLO
+  // FUNZIONE PER SCARTO SILENZIOSO - AGISCE SOLO SULLA MANO DEI GIOCATORI
   const applySilentDiscard = () => {
     if (!gameState || !players) return;
 
@@ -796,7 +799,7 @@ export default function Home() {
       dealerIndex,
       lastAction: `Inizio partita: ${handSize} carte in mano, ${totalCards} carte a terra. Seleziona il dealer e clicca AVANTI.`,
       currentPlayerTurn: "",
-      waitingForDealer: true, // IMPORTANTE: blocca tutto finché il dealer non viene impostato
+      waitingForDealer: true,
       isFirstHand: true,
     });
 
@@ -882,7 +885,7 @@ export default function Home() {
           phase: "betting",
           currentBet: 0,
           currentPlayerTurn: "",
-          waitingForDealer: true, // IMPORTANTE: blocca tutto finché il dealer non viene impostato
+          waitingForDealer: true,
           isFirstHand: false,
           lastAction: `Carta svelata: ${value}${suit.symbol}. Seleziona il dealer per il nuovo giro.`,
         });
@@ -968,7 +971,7 @@ export default function Home() {
     });
   };
 
-  // FUNZIONE PUNTATA MIGLIORATA CON DYNAMIC MINIMUM BET
+  // FUNZIONE PUNTATA MIGLIORATA CON SLIDER BLOCCATO SUL RILANCIO
   const handleBet = () => {
     if (
       !gameState ||
@@ -1146,21 +1149,6 @@ export default function Home() {
       return;
     }
 
-    console.log("=== DEBUG DICHIARAZIONE ===");
-    console.log("Giocatore:", currentUser.username);
-    console.log(
-      "Mano originale:",
-      currentUser.originalHand?.map((c) => `${c.value}${c.suit}`),
-    );
-    console.log(
-      "Mano corrente:",
-      currentUser.hand?.map((c) => `${c.value}${c.suit}`),
-    );
-    console.log(
-      "Carte rivelate:",
-      gameState.revealedCards?.map((c) => `${c.value}${c.suit}`),
-    );
-
     const filteredHand = getFilteredHand(
       currentUser.hand,
       gameState.revealedCards,
@@ -1168,11 +1156,6 @@ export default function Home() {
     );
 
     const correctScore = calculateHandScore(filteredHand, choice);
-
-    console.log("Scelta:", choice);
-    console.log("Punteggio dichiarato:", declaredScore);
-    console.log("Punteggio corretto:", correctScore);
-    console.log("==========================");
 
     if (declaredScore !== correctScore) {
       setValidationError(
@@ -1353,7 +1336,7 @@ export default function Home() {
       revealedCards: [],
       lastAction: `Mano resettata. Rimborsati ${totalRefund.toFixed(2)}€ a tutti i giocatori`,
       currentPlayerTurn: "",
-      waitingForDealer: true, // IMPORTANTE: blocca tutto finché il dealer non viene impostato
+      waitingForDealer: true,
       isFirstHand: false,
     });
 
@@ -1423,7 +1406,7 @@ export default function Home() {
       handSize: 5,
       lastAction:
         "Tutti i giocatori umani eliminati tranne te. Bot resettati a 100€.",
-      waitingForDealer: true, // IMPORTANTE: blocca tutto finché il dealer non viene impostato
+      waitingForDealer: true,
       currentPlayerTurn: "",
       dealerIndex: 0,
       isFirstHand: true,
@@ -1448,7 +1431,7 @@ export default function Home() {
     window.location.reload();
   };
 
-  // FUNZIONE ROBUSTA: Imposta dealer con reset precedente
+  // FUNZIONE ROBUSTA: Imposta dealer con reset precedente - SICUREZZA DEALER UNICO
   const setManualDealer = (id: string) => {
     const p = players[id];
     if (p) {
@@ -1468,19 +1451,7 @@ export default function Home() {
     }
   };
 
-  // FUNZIONE DEBUG
-  const toggleDebugScarto = () => {
-    debugScartoRef.current = !debugScartoRef.current;
-    toast({
-      title: debugScartoRef.current ? "Debug attivato" : "Debug disattivato",
-      description: debugScartoRef.current
-        ? "Il debug dello scarto silenzioso è attivo. Controlla la console."
-        : "Debug disattivato.",
-      duration: 2000,
-    });
-  };
-
-  // Ottieni lista giocatori ordinata con dealer come primo
+  // Ottieni lista giocatori ordinata con dealer come primo - DEBUG SCARTI STORICO
   const getPlayersSortedByDealer = () => {
     if (!gameState) return Object.values(players);
 
@@ -1510,7 +1481,7 @@ export default function Home() {
       </div>
 
       <AnimatePresence>
-        {/* POPUP DEBUG SCARTI - Mostra TUTTE le carte scartate dall'inizio */}
+        {/* POPUP DEBUG SCARTI - Mostra TUTTE le carte scartate dall'inizio - VISIBILE A TUTTI */}
         {showDebugPopup && (
           <motion.div
             initial={{ opacity: 0 }}
@@ -2045,14 +2016,6 @@ export default function Home() {
                       {currentUser.totalBetThisHand.toFixed(2)}€
                     </p>
                   )}
-                {debugScartoRef.current && currentUser?.originalHand && (
-                  <p className="text-[8px] text-yellow-400 mt-1">
-                    Mano originale:{" "}
-                    {currentUser.originalHand
-                      .map((c) => `${c.value}${c.suit}`)
-                      .join(", ")}
-                  </p>
-                )}
               </Card>
             </div>
           )}
@@ -2235,7 +2198,7 @@ export default function Home() {
                       <Slider
                         value={[betAmount]}
                         onValueChange={(v) => setBetAmount(v[0])}
-                        // DYNAMIC MINIMUM BET: il minimo è il currentBet (ma almeno 0.1)
+                        // SLIDER BLOCCATO SUL RILANCIO: il minimo è il currentBet
                         min={gameState?.currentBet || 0.1}
                         // Massimo: 2.00€ o il saldo disponibile
                         max={Math.min(2.0, currentUser?.balance || 2.0)}
