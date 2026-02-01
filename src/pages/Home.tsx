@@ -212,7 +212,7 @@ export default function Home() {
     return playerList[nextIndex].id;
   }, [gameState, players]);
 
-  // RESET BETAMOUNT AL CAMBIO TURNO - SLIDER BLOCCATO SUL RILANCIO
+  // SYNC SLIDER - Reset betAmount al cambio turno
   useEffect(() => {
     if (gameState && localPlayerId && gameState.currentPlayerTurn === localPlayerId) {
       const currentBet = gameState.currentBet || 0.1;
@@ -220,7 +220,7 @@ export default function Home() {
     }
   }, [gameState, localPlayerId]);
 
-  // AUTO-FOLD PER BUDGET INSUFFICIENTE
+  // AUTO-FOLD PER BUDGET INSUFFICIENTE - MIGLIORATA
   useEffect(() => {
     if (
       !gameState ||
@@ -238,8 +238,8 @@ export default function Home() {
     const lastBet = currentPlayer.lastBet || 0;
     const diff = Math.max(0, parseFloat((currentBet - lastBet).toFixed(2)));
 
-    // Controlla se il giocatore ha budget insufficiente per pareggiare
-    if (diff > currentPlayer.balance) {
+    // Controlla se il giocatore ha budget insufficiente per pareggiare la puntata corrente
+    if (currentPlayer.balance < currentBet) {
       const nextPlayerId = getNextActivePlayerId();
       
       db.ref(`game/players/${currentPlayer.id}`).update({
@@ -248,13 +248,13 @@ export default function Home() {
       });
 
       db.ref("game/state").update({
-        lastAction: `${currentPlayer.username} Fold (saldo insufficiente)`,
+        lastAction: `${currentPlayer.username} Fold (saldo ${currentPlayer.balance.toFixed(2)}€ < puntata ${currentBet.toFixed(2)}€)`,
         currentPlayerTurn: nextPlayerId || "",
       });
 
       toast({
         title: "Auto-Fold",
-        description: `Il giocatore ${currentPlayer.username} ha foldato per budget insufficiente`,
+        description: `${currentPlayer.username} ha foldato per budget insufficiente`,
         variant: "destructive",
       });
     }
@@ -361,6 +361,20 @@ export default function Home() {
         const balance = currentPlayer.balance || 0;
 
         const diff = Math.max(0, parseFloat((currentBet - lastBet).toFixed(2)));
+
+        // AUTO-FOLD PER BOT CON BUDGET INSUFFICIENTE
+        if (balance < currentBet) {
+          db.ref(`game/players/${currentTurnId}`).update({
+            folded: true,
+            hasActed: true,
+          });
+
+          db.ref("game/state").update({
+            lastAction: `${currentPlayer.username} Fold (saldo insufficiente)`,
+            currentPlayerTurn: getNextActivePlayerId() || "",
+          });
+          return;
+        }
 
         if (currentBet === 0 || currentBet <= lastBet) {
           db.ref(`game/players/${currentTurnId}`).update({
@@ -1013,11 +1027,13 @@ export default function Home() {
     });
   };
 
-  // FUNZIONI PER INCREMENTO/DECREMENTO BET AMOUNT
+  // FUNZIONI PER INCREMENTO/DECREMENTO BET AMOUNT CON VINCOLI
   const incrementBetAmount = () => {
     const maxBet = Math.min(2.0, currentUser?.balance || 2.0);
+    const minBet = gameState?.currentBet || 0.1;
     const newAmount = parseFloat((betAmount + 0.1).toFixed(2));
-    if (newAmount <= maxBet) {
+    
+    if (newAmount <= maxBet && newAmount >= minBet) {
       setBetAmount(newAmount);
     }
   };
@@ -1025,12 +1041,13 @@ export default function Home() {
   const decrementBetAmount = () => {
     const minBet = gameState?.currentBet || 0.1;
     const newAmount = parseFloat((betAmount - 0.1).toFixed(2));
+    
     if (newAmount >= minBet) {
       setBetAmount(newAmount);
     }
   };
 
-  // FUNZIONE PUNTATA MIGLIORATA CON SLIDER BLOCCATO SUL RILANCIO
+  // FUNZIONE PUNTATA MIGLIORATA
   const handleBet = () => {
     if (
       !gameState ||
@@ -1046,7 +1063,7 @@ export default function Home() {
       return;
     }
 
-    if (!isAdminMode && gameState.currentPlayerTurn !== localPlayerId) {
+    if (gameState.currentPlayerTurn !== localPlayerId) {
       toast({
         title: "Non è il tuo turno",
         description: "Attendi il tuo turno per puntare",
@@ -1081,7 +1098,6 @@ export default function Home() {
     }
 
     const lastBet = currentUser.lastBet || 0;
-
     const diff = Math.max(0, parseFloat((betVal - lastBet).toFixed(2)));
 
     if (diff > currentUser.balance) {
@@ -1138,7 +1154,7 @@ export default function Home() {
       return;
     }
 
-    if (!isAdminMode && gameState.currentPlayerTurn !== localPlayerId) {
+    if (gameState.currentPlayerTurn !== localPlayerId) {
       toast({
         title: "Non è il tuo turno",
         description: "Attendi il tuo turno per fare check",
@@ -1178,7 +1194,7 @@ export default function Home() {
       return;
     }
 
-    if (!isAdminMode && gameState.currentPlayerTurn !== localPlayerId) {
+    if (gameState.currentPlayerTurn !== localPlayerId) {
       toast({
         title: "Non è il tuo turno",
         description: "Attendi il tuo turno per foldare",
@@ -2222,10 +2238,10 @@ export default function Home() {
           )}
 
           <AnimatePresence>
-            {(isAdminMode ||
-              (gameState?.phase === "betting" &&
-                currentUser &&
-                gameState.currentPlayerTurn === localPlayerId)) &&
+            {/* CORREZIONE: MENÙ PUNTATA VISIBILE SOLO AL TURNO - RIMOSSO isAdminMode */}
+            {gameState?.phase === "betting" &&
+              currentUser &&
+              gameState.currentPlayerTurn === localPlayerId &&
               !gameState?.waitingForDealer && (
                 <motion.div
                   key="betting-panel"
@@ -2254,6 +2270,7 @@ export default function Home() {
                           €
                         </span>
                       </div>
+                      {/* AGGIUNTA TASTI + E - CON FLEX */}
                       <div className="flex items-center gap-2 w-full">
                         <Button
                           onClick={decrementBetAmount}
@@ -2289,8 +2306,7 @@ export default function Home() {
                       <Button
                         onClick={handleCheck}
                         disabled={
-                          currentUser?.lastBet !== gameState?.currentBet &&
-                          !isAdminMode
+                          currentUser?.lastBet !== gameState?.currentBet
                         }
                         className="h-12 md:h-10 flex-1 md:py-1 md:px-3 bg-black border-2 border-[#D4AF37]/40 text-[#D4AF37] font-black text-lg md:text-[10px] italic rounded-xl uppercase break-words"
                       >
